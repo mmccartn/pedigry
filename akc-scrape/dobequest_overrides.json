@@ -1,0 +1,33 @@
+{
+  "Dea Doloris Vom Franckenhorst": {
+    "dobequest_id": "488",
+    "reason": "Verified spelling variant: Doloris/Dolores; vom/v",
+    "confidence": "manual_override"
+  },
+  "Yo Ro Von Verbrocken H": {
+    "dobequest_id": "67570",
+    "reason": "Verified naming variant: Von/v; terminal H omitted by DobeQuest",
+    "confidence": "manual_override"
+  },
+  "Elfred's Miss Universe": {
+    "dobequest_id": "29246",
+    "reason": "Verified distinct dog from Elfred's Miss Universe II",
+    "confidence": "manual_override"
+  },
+  "Bordo Vom Furstenfeld": {
+    "dobequest_id": "10399",
+    "reason": "Verified Canadian DobeQuest profile",
+    "confidence": "manual_override"
+  },
+  "Hugelhof Wishing Ring": {
+    "dobequest_id": "1817",
+    "reason": "Verified naming variant: Hugelhof's/Hugelhof",
+    "confidence": "manual_override"
+  },
+  "Ch Koven's Jet Set": {
+    "dobequest_id": "1499",
+    "akc_number": "",
+    "reason": "DobeQuest WE763631 resolves to a Shetland Sheepdog; use AKC name search",
+    "confidence": "manual_override"
+  }
+}

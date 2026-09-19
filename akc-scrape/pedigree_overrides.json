@@ -1,0 +1,24 @@
+{
+  "WP47505601": {
+    "parents": {
+      "dam": {
+        "name": "Arg Ch Lluvia Dorada De Lions",
+        "dobequest_id": "1484"
+      }
+    },
+    "reason": "Verified DobeQuest parent; AKC PDF has Le/Lions typo"
+  },
+  "WB047353": {
+    "parents": {
+      "sire": {
+        "name": "Ch Kay Hill's Takeswon to Nowon",
+        "akc_number": "WA476128"
+      },
+      "dam": {
+        "name": "Tara of Ayrlawn",
+        "akc_number": "WA546201"
+      }
+    },
+    "reason": "Verified sibling/litter relationship and DobeQuest corroboration"
+  }
+}

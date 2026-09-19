@@ -1,0 +1,17 @@
+__pycache__/
+.akc-auth-state.json
+akc-scrape/unresolved-*.txt
+combine/pedigree_dataset.json
+dependencies/
+dobe-quest_2026*.json
+dogs.json
+downloads_official-forms/
+downloads/
+failed-scrapes/
+NOTES.md
+result-reports/
+step-artifacts/
+
+site/node_modules/
+site/dist/
+site/SITE_PLANNING.txt

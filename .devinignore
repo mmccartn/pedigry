@@ -1,0 +1,6 @@
+akc-scrape/dependencies/
+akc-scrape/downloads_official-forms/
+akc-scrape/failed-scrapes/
+
+pedigry/node_modules/
+pedigry/dist/
