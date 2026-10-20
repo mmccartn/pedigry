@@ -9,15 +9,18 @@ import json
 from copy import deepcopy
 import os
 import re
+import signal
 import sys
 import time
 from collections import deque
 from datetime import datetime, timezone
+from html import unescape
 from pathlib import Path
 
 from akc_titles import PREFIX_TITLES, SUFFIX_TITLES
+from dataset_journal import DatasetJournal
 from typing import Any
-from urllib.parse import parse_qs, urljoin, urlparse
+from urllib.parse import parse_qs, urlencode, urljoin, urlparse
 
 from pypdf import PdfReader
 from playwright.sync_api import (
@@ -37,7 +40,7 @@ ENTRY_FORM_VALUE = "AHN999_1003"
 CONTACT_FIELDS = ("displayemail", "displayphone", "displayaddress")
 POPUP_EVENT_TIMEOUT = 2_000
 DOBEQUEST_TOKEN_EQUIVALENTS = {"vom": "v", "von": "v", "v": "v"}
-ROMAN_NUMERALS = {"I", "II", "III", "IV", "V", "VI", "VII", "VIII", "IX", "X", "XI", "XII"}
+ROMAN_NUMERAL_PATTERN = re.compile(r"^M{0,3}(CM|CD|D?C{0,3})(XC|XL|L?X{0,3})(IX|IV|V?I{0,3})$")
 DOBEQUEST_IGNORED_TOKENS = {"am", "arg", "bda", "bfl", "brz", "can", "col", "ghc", "grch", "intl", "lc", "mex", "ukc", "urg", "ven", "world"}
 
 
@@ -47,6 +50,10 @@ class AkcLookupError(RuntimeError):
     def __init__(self, status: str, message: str) -> None:
         super().__init__(message)
         self.status = status
+
+
+class AkcFormError(RuntimeError):
+    """Represent a temporary MyAKC entry-form generation failure."""
 
 
 def log_dog(name: str, level: int) -> None:
@@ -185,31 +192,76 @@ def mapped_pdf_ids(records: dict[str, dict[str, Any]]) -> set[str]:
     return {str(record["pdf_id"]) for record in records.values() if record.get("pdf_id")}
 
 
-def reusable_pdf(downloads_dir: Path, akc_number: str, used_pdf_ids: set[str]) -> Path | None:
-    """Find an unmapped PDF matching the selected dog's AKC number."""
-    for pdf_path in downloads_dir.glob("*.pdf"):
-        if pdf_path.stem in used_pdf_ids:
-            continue
+PDF_INDEX_CACHE_NAME = ".akc-pdf-index.json"
+
+
+def build_pdf_metadata_index(downloads_dir: Path, report: bool = True) -> dict[str, dict[str, Any]]:
+    """Cache PDF identities and refresh only files whose metadata changed."""
+    cache_path = downloads_dir / PDF_INDEX_CACHE_NAME
+    cached = json.loads(cache_path.read_text(encoding="utf-8")) if cache_path.exists() else {}
+    paths = list(downloads_dir.glob("*.pdf"))
+    pending: list[tuple[Path, Any]] = []
+    entries: dict[str, dict[str, Any]] = {}
+    for pdf_path in paths:
+        stat = pdf_path.stat()
+        prior = cached.get(pdf_path.name, {})
+        if prior.get("size") == stat.st_size and prior.get("mtime_ns") == stat.st_mtime_ns:
+            entries[pdf_path.name] = prior
+        else:
+            pending.append((pdf_path, stat))
+    if report:
+        print(
+            f"PDF index: {len(paths)} files; {len(entries)} cached; "
+            f"{len(pending)} new or changed.",
+            flush=True,
+        )
+    for position, (pdf_path, stat) in enumerate(pending, 1):
         try:
-            if extract_pdf(pdf_path)["akc_number"] == akc_number:
-                return pdf_path
+            record = extract_pdf(pdf_path)
+            entries[pdf_path.name] = {
+                "size": stat.st_size,
+                "mtime_ns": stat.st_mtime_ns,
+                "akc_number": str(record.get("akc_number") or ""),
+                "name": str(record.get("name") or ""),
+            }
         except Exception:
-            continue
-    return None
+            entries[pdf_path.name] = {"size": stat.st_size, "mtime_ns": stat.st_mtime_ns, "akc_number": "", "name": ""}
+        if report and (position % 100 == 0 or position == len(pending)):
+            print(f"PDF index: extracted metadata for {position}/{len(pending)} changed files.", flush=True)
+    if pending or set(cached) != set(entries):
+        cache_path.write_text(json.dumps(entries, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return entries
+
+
+def build_pdf_number_index(downloads_dir: Path) -> dict[str, list[Path]]:
+    """Index local PDFs by AKC number using the persistent metadata cache."""
+    index: dict[str, list[Path]] = {}
+    for filename, entry in build_pdf_metadata_index(downloads_dir).items():
+        akc_number = str(entry.get("akc_number") or "")
+        if akc_number:
+            index.setdefault(akc_number, []).append(downloads_dir / filename)
+    return index
+
+
+def reusable_pdf(
+    downloads_dir: Path,
+    akc_number: str,
+    used_pdf_ids: set[str],
+    pdf_number_index: dict[str, list[Path]] | None = None,
+) -> Path | None:
+    """Find an unmapped PDF matching the selected dog's AKC number."""
+    candidates = (pdf_number_index or build_pdf_number_index(downloads_dir)).get(akc_number, [])
+    return next((pdf_path for pdf_path in candidates if pdf_path.stem not in used_pdf_ids), None)
 
 
 def build_pdf_name_index(downloads_dir: Path) -> dict[str, dict[str, Path]]:
     """Index local PDFs by normalized dog name and unique AKC number."""
     index: dict[str, dict[str, Path]] = {}
-    for pdf_path in downloads_dir.glob("*.pdf"):
-        try:
-            record = extract_pdf(pdf_path)
-        except Exception:
-            continue
-        name = registered_name(str(record.get("name") or "")).casefold()
-        akc_number = str(record.get("akc_number") or "")
+    for filename, entry in build_pdf_metadata_index(downloads_dir, report=False).items():
+        name = registered_name(str(entry.get("name") or "")).casefold()
+        akc_number = str(entry.get("akc_number") or "")
         if name and akc_number:
-            index.setdefault(name, {}).setdefault(akc_number, pdf_path)
+            index.setdefault(name, {}).setdefault(akc_number, downloads_dir / filename)
     return index
 
 
@@ -304,9 +356,30 @@ def name_candidates(name: str) -> list[str]:
     if normalized.casefold() != name.casefold():
         candidates.append(normalized)
     words = normalized.split()
-    if len(words) > 1 and words[-1] in ROMAN_NUMERALS:
+    if len(words) > 1 and is_roman_numeral(words[-1]):
         candidates.append(" ".join(words[:-1]))
+    trailing_letters = words.copy()
+    while len(trailing_letters) > 1 and len(trailing_letters[-1]) == 1 and trailing_letters[-1].isupper():
+        trailing_letters.pop()
+        candidates.append(" ".join(trailing_letters))
     return list(dict.fromkeys(candidates))
+
+
+def has_terminal_single_letter(name: str) -> bool:
+    """Return whether a title-normalized name ends in a single uppercase letter."""
+    words = registered_name(name).split()
+    return len(words) > 1 and len(words[-1]) == 1 and words[-1].isupper()
+
+
+def is_roman_numeral(token: str) -> bool:
+    """Return whether a token is a valid uppercase standard Roman numeral."""
+    return bool(token) and token == token.upper() and bool(ROMAN_NUMERAL_PATTERN.fullmatch(token))
+
+
+def has_terminal_roman_numeral(name: str) -> bool:
+    """Return whether a title-normalized name ends in an uppercase Roman numeral."""
+    words = registered_name(name).split()
+    return len(words) > 1 and is_roman_numeral(words[-1])
 
 
 def dobequest_tokens(name: str) -> list[str]:
@@ -437,6 +510,12 @@ def pdf_identity_matches(requested_name: str, pdf_name: str, dobequest: dict[str
     return bool(dobequest) and dobequest_tokens(requested_name) == dobequest_tokens(pdf_name)
 
 
+def same_breed(expected: str, actual: str) -> bool:
+    """Compare breed labels while ignoring case and a terminal plural s."""
+    normalize = lambda value: re.sub(r"[^a-z0-9]+", "", value.casefold()).removesuffix("s")
+    return bool(expected and actual) and normalize(expected) == normalize(actual)
+
+
 def registration_number(row: Any) -> str:
     """Extract the AKC number encoded in a managed-list row."""
     onclick = row.locator("input[type='checkbox']").first.get_attribute("onclick") or ""
@@ -465,12 +544,12 @@ def select_managed_row(page: Page, row: Any) -> None:
         raise RuntimeError("MyAKC did not retain exactly one selected dog row.")
 
 
-def choose_multi_result(popup: Page, candidate: str) -> None:
-    """Select the exact candidate from an AKC multiple-result page."""
+def choose_multi_result(popup: Page, candidate: str, expected_name: str) -> None:
+    """Select the exact expected dog from an AKC multiple-result page."""
     matching_option = None
     for option in popup.locator("input[name='values_selected']").all():
         _, _, result_name = (option.get_attribute("value") or "").partition("|")
-        if registered_name(result_name).casefold() == registered_name(candidate).casefold():
+        if registered_name(result_name).casefold() == registered_name(expected_name).casefold():
             matching_option = option
             break
     if matching_option is None:
@@ -482,8 +561,8 @@ def choose_multi_result(popup: Page, candidate: str) -> None:
         ]
         raise AkcLookupError(
             "ambiguous",
-            f"AKC returned multiple dogs for {candidate!r}, but none "
-            f"exactly matched. Results: {', '.join(results)}",
+            f"AKC returned multiple dogs for {candidate!r}, but none matched "
+            f"{expected_name!r}. Results: {', '.join(results)}",
         )
     matching_option.check()
     with popup.expect_navigation(wait_until="domcontentloaded", timeout=30_000):
@@ -494,6 +573,9 @@ def choose_dog(page: Page, name: str, breed: str) -> tuple[str, str]:
     """Add or reuse a dog and return its list name and AKC number."""
     page.goto(MANAGE_DOGS_URL, wait_until="domcontentloaded")
     candidates = name_candidates(name)
+    if has_terminal_roman_numeral(name) or has_terminal_single_letter(name):
+        shortest_candidate = min(candidates, key=lambda candidate: len(candidate.split()))
+        candidates = [shortest_candidate, *[candidate for candidate in candidates if candidate != shortest_candidate]]
     candidate_names = {candidate.casefold() for candidate in candidates}
     for link in page.locator("a.gridlink").all():
         existing_name = link.inner_text().strip()
@@ -510,38 +592,53 @@ def choose_dog(page: Page, name: str, breed: str) -> tuple[str, str]:
             raise RuntimeError("MyAKC did not open the Add Dog popup.")
     canonical_name = ""
     akc_number = ""
+    too_many_candidates: list[str] = []
     for candidate in candidates:
         log_step(f"Trying AKC name candidate: {candidate}", 1)
         popup.locator("input[name='get_dog_by'][value='O']").check()
         popup.locator("#dog_name").fill(candidate)
         popup.locator("select[name='bvgcode']").select_option(label=breed)
-        with popup.expect_navigation(wait_until="domcontentloaded", timeout=30_000):
-            popup.locator("#button").click()
+        try:
+            with popup.expect_navigation(wait_until="domcontentloaded", timeout=30_000):
+                popup.locator("#button").click(no_wait_after=True)
+        except PlaywrightTimeoutError:
+            log_step("MyAKC name lookup navigation did not finish; inspecting response state", 2)
+            popup.wait_for_timeout(1_000)
         body = popup.locator("body").inner_text()
+        if popup.locator("#dog_name").count() and not re.search(r"too many dogs were found|could not be added.*could not be found|no results were found|not found|no dog", body, re.I | re.S):
+            raise AkcLookupError("lookup_timeout", f"MyAKC did not return a lookup result for {candidate!r}.")
         if re.search(r"too many dogs were found", body, re.I):
-            raise AkcLookupError(
-                "too_many_matches",
-                f"AKC found too many dogs for {candidate!r}; use a more specific registered name.",
-            )
+            too_many_candidates.append(candidate)
+            continue
         if re.search(r"could not be added.*could not be found", body, re.I | re.S):
-            raise AkcLookupError("not_found", f"AKC did not find {candidate!r} by name.")
+            continue
         if re.search(r"no results were found|not found|no dog", body, re.I):
             continue
+        expected_name = name if has_terminal_roman_numeral(name) or has_terminal_single_letter(name) else candidate
         if popup.locator("input[name='values_selected']").count():
-            choose_multi_result(popup, candidate)
+            choose_multi_result(popup, candidate, expected_name)
         canonical_name = popup.locator("form table strong").first.inner_text().strip()
         akc_number = popup.locator("#dog_reg_num").input_value().strip()
         if (
             canonical_name
-            and registered_name(canonical_name).casefold() != registered_name(candidate).casefold()
+            and registered_name(canonical_name).casefold() != registered_name(expected_name).casefold()
         ):
-            raise AkcLookupError(
-                "not_found",
-                f"AKC returned {canonical_name!r}, which does not match {candidate!r}.",
-            )
+            log_step(f"AKC returned nonmatching result {canonical_name!r}; trying next candidate", 2)
+            try:
+                popup.go_back(wait_until="domcontentloaded", timeout=30_000)
+            except PlaywrightError:
+                popup.locator("#Back").click()
+            canonical_name = ""
+            akc_number = ""
+            continue
         if canonical_name and akc_number:
             break
     if not canonical_name or not akc_number:
+        if len(too_many_candidates) == len(candidates):
+            raise AkcLookupError(
+                "too_many_matches",
+                f"AKC found too many dogs for every candidate: {', '.join(too_many_candidates)}.",
+            )
         raise AkcLookupError(
             "not_found",
             f"AKC did not find a {breed} named {name!r} after removing recognized titles.",
@@ -559,21 +656,97 @@ def choose_dog(page: Page, name: str, breed: str) -> tuple[str, str]:
     return canonical_name, akc_number
 
 
+def direct_name_lookup_add(page: Page, name: str, breed: str) -> tuple[str, str]:
+    """Resolve and add a dog through captured MyAKC name-lookup POSTs."""
+    breed_codes = {"Doberman Pinschers": "611"}
+    breed_code = breed_codes.get(breed)
+    if not breed_code:
+        raise AkcLookupError("http_fallback", f"No direct MyAKC breed code is configured for {breed!r}.")
+    candidates = name_candidates(name)
+    if has_terminal_roman_numeral(name) or has_terminal_single_letter(name):
+        shortest_candidate = min(candidates, key=lambda candidate: len(candidate.split()))
+        candidates = [shortest_candidate, *[candidate for candidate in candidates if candidate != shortest_candidate]]
+    lookup_url = "https://www.apps.akc.org/apps/online_accounts/dog_management/index_popup_dog.cfm?action=add_dog"
+    too_many_candidates: list[str] = []
+    canonical_name = ""
+    akc_number = ""
+    for candidate in candidates:
+        response = page.context.request.post(
+            lookup_url,
+            form={"dog_reg_num": "", "litter_num": "", "get_dog_by": "O", "dog_name": candidate, "bvgcode": breed_code},
+        )
+        if not response.ok:
+            raise AkcLookupError("http_fallback", f"Direct MyAKC lookup returned HTTP {response.status}.")
+        body = response.text()
+        if re.search(r"too many dogs were found", body, re.I):
+            too_many_candidates.append(candidate)
+            continue
+        if re.search(r"no results were found|could not be found|not found", body, re.I):
+            continue
+        expected_name = name if has_terminal_roman_numeral(name) or has_terminal_single_letter(name) else candidate
+        selected_body = body
+        values = re.findall(r"<input[^>]*name=['\"]values_selected['\"][^>]*value=['\"]([^'\"]+)", body, re.I)
+        if values:
+            selected = next(
+                (value for value in values if registered_name(unescape(value.partition("|")[2]).strip()).casefold() == registered_name(expected_name).casefold()),
+                None,
+            )
+            if not selected:
+                continue
+            selected_response = page.context.request.post(
+                "https://www.apps.akc.org/apps/online_accounts/dog_management/index_popup_dog.cfm?action=add_dog_other",
+                form={"values_selected": unescape(selected)},
+            )
+            if not selected_response.ok:
+                raise AkcLookupError("http_fallback", f"Direct MyAKC result selection returned HTTP {selected_response.status}.")
+            selected_body = selected_response.text()
+        number_match = re.search(r"name=['\"]dog_reg_num['\"][^>]*value=['\"]([^'\"]+)", selected_body, re.I)
+        name_match = re.search(r"<strong[^>]*>\s*(.*?)\s*</strong>", selected_body, re.I | re.S)
+        if not number_match or not name_match:
+            raise AkcLookupError("http_fallback", "Direct MyAKC lookup returned unexpected HTML.")
+        akc_number = unescape(number_match.group(1)).strip()
+        canonical_name = re.sub(r"<[^>]+>", "", unescape(name_match.group(1))).strip()
+        if registered_name(canonical_name).casefold() != registered_name(expected_name).casefold():
+            canonical_name = ""
+            akc_number = ""
+            continue
+        break
+    if not canonical_name or not akc_number:
+        status = "too_many_matches" if len(too_many_candidates) == len(candidates) else "not_found"
+        raise AkcLookupError(status, f"Direct MyAKC did not resolve {name!r}.")
+    add_response = page.context.request.post(
+        "https://www.apps.akc.org/apps/online_accounts/dog_management/index_popup_dog.cfm?action=add_dog_io",
+        form={"dog_dio_int": "DOI", "dog_active": "NONE", "dog_reg_num": akc_number, "Submit": "Next >"},
+    )
+    if not add_response.ok:
+        raise AkcLookupError("http_fallback", f"Direct MyAKC Add Dog request returned HTTP {add_response.status}.")
+    page.goto(MANAGE_DOGS_URL, wait_until="domcontentloaded")
+    return canonical_name, akc_number
+
+
 def choose_dog_by_number(page: Page, akc_number: str) -> tuple[str, str]:
     """Add or reuse a dog by a verified AKC registration number."""
     page.goto(MANAGE_DOGS_URL, wait_until="domcontentloaded")
     row = managed_row(page, "", akc_number)
     if row.count():
         return row.locator("a.gridlink").first.inner_text().strip(), akc_number
-    try:
-        with page.expect_popup(timeout=POPUP_EVENT_TIMEOUT) as popup_info:
-            page.locator("a.purple", has_text="Add A Dog").click()
-        popup = popup_info.value
-        popup.wait_for_load_state("domcontentloaded")
-    except PlaywrightTimeoutError:
-        popup = wait_for_context_page(page, "index_popup_dog.cfm", 30_000)
-        if not popup:
-            raise RuntimeError("MyAKC did not open the Add Dog popup.")
+    popup: Page | None = None
+    for attempt in range(2):
+        try:
+            with page.expect_popup(timeout=POPUP_EVENT_TIMEOUT) as popup_info:
+                page.locator("a.purple", has_text="Add A Dog").click()
+            popup = popup_info.value
+            popup.wait_for_load_state("domcontentloaded")
+            break
+        except PlaywrightTimeoutError:
+            popup = wait_for_context_page(page, "index_popup_dog.cfm", 10_000)
+            if popup:
+                break
+            if attempt == 0:
+                log_step("Add Dog popup did not open; refreshing MyAKC and retrying", 2)
+                page.goto(MANAGE_DOGS_URL, wait_until="domcontentloaded")
+    if not popup:
+        raise AkcLookupError("popup_timeout", "MyAKC did not open the Add Dog popup.")
     log_step(f"Trying AKC number lookup: {akc_number}", 2)
     popup.locator("input[name='get_dog_by'][value='D']").check()
     popup.locator("#dog_reg_num").fill(akc_number)
@@ -656,6 +829,7 @@ def dog_details(page: Page, name: str, akc_number: str) -> dict[str, Any]:
     lines = details.inner_text().splitlines()
     screens = medical_screens(lines)
     return {
+        "_myakc_breed": detail_value(lines, ("Breed",)),
         "breed_variety": detail_value(lines, ("Variety", "Breed Variety")),
         "color": detail_value(lines, ("Color",)),
         "markings": detail_value(lines, ("Markings",)),
@@ -696,35 +870,51 @@ def open_entry_form(page: Page, name: str, akc_number: str) -> Page:
     """Open an entry-form chooser and verify its selected AKC number."""
     form_selector = f"input[name='form'][value='{ENTRY_FORM_VALUE}']"
     close_stale_entry_pages(page)
-    for attempt in range(2):
-        row = managed_row(page, name, akc_number)
-        select_managed_row(page, row)
-        page.locator("select[name='action_items']").select_option("6")
+    last_error: Exception | None = None
+    for attempt in range(3):
+        form: Page | None = None
+        selected = False
         try:
-            with page.expect_popup(timeout=POPUP_EVENT_TIMEOUT) as popup_info:
-                page.locator("#go_filters").click()
-            form = popup_info.value
-            form.wait_for_load_state("domcontentloaded")
-        except PlaywrightTimeoutError:
-            form = wait_for_context_page(page, "dsp_choose_pdf_form", 30_000) or page
-            form.locator(form_selector).wait_for(timeout=10_000)
-        chooser_number = form.locator("input[name='dog_reg_num']").input_value().strip()
-        if chooser_number == akc_number:
-            return form
-        log_step(f"Entry chooser mismatch: expected {akc_number}, received {chooser_number}", 2)
-        if form is not page and not form.is_closed():
-            form.close()
-        if attempt == 0:
+            row = managed_row(page, name, akc_number)
+            select_managed_row(page, row)
+            page.locator("select[name='action_items']").select_option("6")
+            try:
+                with page.expect_popup(timeout=POPUP_EVENT_TIMEOUT) as popup_info:
+                    page.locator("#go_filters").click()
+                form = popup_info.value
+                form.wait_for_load_state("domcontentloaded")
+            except PlaywrightTimeoutError:
+                form = wait_for_context_page(page, "dsp_choose_pdf_form", 30_000) or page
+                form.locator(form_selector).wait_for(timeout=30_000)
+            chooser_number = form.locator("input[name='dog_reg_num']").input_value().strip()
+            if chooser_number == akc_number:
+                selected = True
+                return form
+            log_step(f"Entry chooser mismatch: expected {akc_number}, received {chooser_number}", 2)
+        except PlaywrightTimeoutError as error:
+            last_error = error
+            log_step(f"Entry chooser did not load (attempt {attempt + 1}/3)", 2)
+        finally:
+            if not selected and form is not None and form is not page and not form.is_closed():
+                form.close()
+        if attempt < 2:
             log_step("Retrying entry-form selection after refreshing MyAKC", 2)
+            close_stale_entry_pages(page)
             page.goto(MANAGE_DOGS_URL, wait_until="domcontentloaded")
-    raise RuntimeError(f"MyAKC entry chooser did not select AKC number {akc_number!r}.")
+    detail = f": {last_error}" if last_error else ""
+    raise AkcFormError(f"MyAKC entry chooser did not select AKC number {akc_number!r}{detail}")
 
 
 def download_entry_form(page: Page, name: str, akc_number: str, downloads_dir: Path) -> Path:
     """Generate, download, and return the official AKC form PDF."""
     form = open_entry_form(page, name, akc_number)
     form_selector = f"input[name='form'][value='{ENTRY_FORM_VALUE}']"
-    form.locator(form_selector).check()
+    try:
+        form.locator(form_selector).check()
+    except PlaywrightTimeoutError as error:
+        if form is not page and not form.is_closed():
+            form.close()
+        raise AkcFormError(f"MyAKC entry chooser did not expose form {ENTRY_FORM_VALUE!r}") from error
     for field_name in CONTACT_FIELDS:
         checkbox = form.locator(f"input[name='{field_name}']")
         if checkbox.is_checked():
@@ -734,9 +924,16 @@ def download_entry_form(page: Page, name: str, akc_number: str, downloads_dir: P
             form.locator("input[type='button'][value='Submit']").click()
         report = report_info.value
         report.wait_for_load_state("domcontentloaded")
-    except PlaywrightTimeoutError:
+    except PlaywrightTimeoutError as error:
         report = wait_for_context_page(form, "/apps/dynamicpdfs/index.cfm", 30_000) or form
-        report.locator("a[href*='/akcecom/pdf/cms/']").wait_for(timeout=10_000)
+        try:
+            report.locator("a[href*='/akcecom/pdf/cms/']").wait_for(timeout=30_000)
+        except PlaywrightTimeoutError as wait_error:
+            if report is not form and not report.is_closed():
+                report.close()
+            if form is not page and not form.is_closed():
+                form.close()
+            raise AkcFormError("MyAKC report page did not expose a PDF link") from wait_error
     report_number = parse_qs(urlparse(report.url).query).get("dog_reg_num", [""])[0]
     if report_number and report_number != akc_number:
         if report is not form and report is not page and not report.is_closed():
@@ -916,9 +1113,16 @@ def collect(
     retry_not_found: bool,
     retry_unresolved: bool,
     prefer_local_pdfs: bool,
+    journal_path: Path | None,
+    checkpoint_every: int,
+    http_optimization: bool,
+    record_har: Path | None,
 ) -> None:
     """Collect a pedigree breadth-first and checkpoint each dog."""
     context_options: dict[str, Any] = {"accept_downloads": True}
+    if record_har:
+        record_har.parent.mkdir(parents=True, exist_ok=True)
+        context_options.update({"record_har_path": str(record_har), "record_har_content": "embed", "record_har_mode": "full"})
     if auth_state.exists():
         context_options["storage_state"] = str(auth_state)
     context = browser.new_context(**context_options)
@@ -929,14 +1133,37 @@ def collect(
     dobequest_override_map = load_dobequest_overrides(dobequest_overrides)
     akc_number_override_map = load_akc_number_overrides(akc_number_overrides)
     pedigree_override_map = load_pedigree_overrides(pedigree_overrides)
+    journal = DatasetJournal(output, journal_path)
     existing_data = json.loads(output.read_text(encoding="utf-8")) if output.exists() else {}
     records: dict[str, dict[str, Any]] = existing_data.get("records", existing_data)
+    replayed = journal.replay(records)
+    if replayed:
+        log_step(f"Replayed {replayed} un-compacted dataset journal events")
     for record in records.values():
         hydrate_record(record)
         apply_pedigree_override(record, pedigree_override_map)
     refresh_relationship_schema(records)
     if records:
         save_records(records, output)
+        if journal.journal_path.exists():
+            journal.journal_path.write_text("", encoding="utf-8")
+    dirty_records = 0
+
+    def persist(upsert_keys: list[str], delete_keys: list[str] | None = None) -> None:
+        nonlocal dirty_records
+        for key in upsert_keys:
+            if key in records:
+                journal.upsert(key, serialized_record(records[key]))
+                dirty_records += 1
+        for key in delete_keys or []:
+            journal.delete(key)
+            dirty_records += 1
+        if dirty_records >= checkpoint_every:
+            refresh_relationship_schema(records)
+            journal.compact(lambda: save_records(records, output))
+            dirty_records = 0
+            log_step("Compacted dataset journal into dogs.json")
+
     pending = deque([(root_name, 1)])
     records_by_name = {
         alias.casefold(): record
@@ -945,6 +1172,7 @@ def collect(
     }
     expanded: set[str] = set()
     downloads_dir.mkdir(parents=True, exist_ok=True)
+    pdf_number_index = build_pdf_number_index(downloads_dir)
     pdf_name_index = build_pdf_name_index(downloads_dir) if prefer_local_pdfs else {}
     if prefer_local_pdfs:
         pdf_file_count = len(list(downloads_dir.glob("*.pdf")))
@@ -1003,12 +1231,12 @@ def collect(
                 records_by_name[name_key] = record
                 for alias in record["aliases"]:
                     records_by_name[alias.casefold()] = record
-                refresh_relationship_schema(records)
+                apply_schema(record, record["akc_lookup_status"])
                 if record["id"] != key:
                     records[record["id"]] = records.pop(key)
                 if replacement_key and replacement_key in records:
                     records.pop(replacement_key)
-                save_records(records, output)
+                persist([record["id"]], [replacement_key] if replacement_key else [])
                 from_local_pdf = True
         if record:
             log_step(f"Using existing checkpoint ({record.get('akc_lookup_status', 'legacy')})")
@@ -1023,7 +1251,14 @@ def collect(
                     resolution = "resolved_by_manual_akc_override"
                 else:
                     log_step("Searching AKC by name", 1)
-                    canonical_name, selected_akc_number = choose_dog(page, requested_name, breed)
+                    if http_optimization:
+                        try:
+                            canonical_name, selected_akc_number = direct_name_lookup_add(page, requested_name, breed)
+                        except AkcLookupError as http_error:
+                            log_step(f"Direct name lookup requires browser fallback: {http_error}", 2)
+                            canonical_name, selected_akc_number = choose_dog(page, requested_name, breed)
+                    else:
+                        canonical_name, selected_akc_number = choose_dog(page, requested_name, breed)
             except AkcLookupError as error:
                 log_step(f"AKC name lookup: {error.status}", 1)
                 log_step("Checking DobeQuest identity index", 1)
@@ -1052,7 +1287,7 @@ def collect(
                     records_by_name[name_key] = record
                     if replacement_key and replacement_key in records:
                         records.pop(replacement_key)
-                    save_records(records, output)
+                    persist([record["id"]], [replacement_key] if replacement_key else [])
                     expanded.add(name_key)
                     if levels is None or level < levels:
                         for parent in (record["sire"], record["dam"]):
@@ -1066,18 +1301,54 @@ def collect(
                     key = f"unresolved:{re.sub(r'[^a-z0-9]+', '-', name_key).strip('-')}"
                     records[key] = record
                     records_by_name[name_key] = record
-                    save_records(records, output)
+                    persist([record["id"]], [replacement_key] if replacement_key else [])
                     expanded.add(name_key)
                     continue
             log_step(f"Resolved AKC identity: {canonical_name} ({selected_akc_number})", 1)
             log_step("Reading MyAKC Dog Information", 1)
             details = dog_details(page, canonical_name, selected_akc_number)
-            pdf = reusable_pdf(downloads_dir, selected_akc_number, mapped_pdf_ids(records))
+            myakc_breed = str(details.pop("_myakc_breed", ""))
+            if resolution == "resolved_by_dobequest_akc_number" and (
+                not pdf_identity_matches(requested_name, canonical_name, dobequest)
+                or not same_breed(breed, myakc_breed)
+            ):
+                log_step(
+                    f"DobeQuest AKC mismatch: MyAKC returned {canonical_name} ({myakc_breed})",
+                    1,
+                )
+                remove_dog_of_interest(page, canonical_name, selected_akc_number)
+                record = unresolved_record(requested_name, breed, "external_only")
+                apply_dobequest_parents(record, dobequest)
+                apply_schema(record, "external_only", dobequest)
+                records[record["id"]] = record
+                records_by_name[name_key] = record
+                if replacement_key and replacement_key in records:
+                    records.pop(replacement_key)
+                persist([record["id"]], [replacement_key] if replacement_key else [])
+                expanded.add(name_key)
+                if levels is None or level < levels:
+                    for parent in (record["sire"], record["dam"]):
+                        if parent and parent.casefold() not in expanded:
+                            pending.append((parent, level + 1))
+                continue
+            pdf = reusable_pdf(downloads_dir, selected_akc_number, mapped_pdf_ids(records), pdf_number_index)
             if pdf:
                 log_step(f"Reusing saved PDF: {pdf.name}", 1)
             else:
                 log_step("Generating compact Herding Test/Trial PDF", 1)
-                pdf = download_entry_form(page, canonical_name, selected_akc_number, downloads_dir)
+                try:
+                    pdf = download_entry_form(page, canonical_name, selected_akc_number, downloads_dir)
+                except (AkcFormError, PlaywrightTimeoutError) as error:
+                    log_step(f"AKC form generation failed after retries: {error}", 1)
+                    record = unresolved_record(requested_name, breed, "form_timeout")
+                    apply_schema(record, "form_timeout", dobequest)
+                    records[record["id"]] = record
+                    records_by_name[name_key] = record
+                    if remove_after_processing:
+                        remove_dog_of_interest(page, canonical_name, selected_akc_number)
+                    persist([record["id"]], [replacement_key] if replacement_key else [])
+                    expanded.add(name_key)
+                    continue
             record = extract_pdf(pdf)
             verified_dobequest_number = (
                 dobequest
@@ -1092,7 +1363,7 @@ def collect(
                     try:
                         canonical_name, selected_akc_number = choose_dog_by_number(page, dobequest["akc_number"])
                         details = dog_details(page, canonical_name, selected_akc_number)
-                        pdf = reusable_pdf(downloads_dir, selected_akc_number, mapped_pdf_ids(records))
+                        pdf = reusable_pdf(downloads_dir, selected_akc_number, mapped_pdf_ids(records), pdf_number_index)
                         if not pdf:
                             pdf = download_entry_form(page, canonical_name, selected_akc_number, downloads_dir)
                         record = extract_pdf(pdf)
@@ -1112,7 +1383,7 @@ def collect(
                     records_by_name[name_key] = record
                     if remove_after_processing:
                         remove_dog_of_interest(page, canonical_name, selected_akc_number)
-                    save_records(records, output)
+                    persist([record["id"]], [replacement_key] if replacement_key else [])
                     expanded.add(name_key)
                     continue
             record.update(details)
@@ -1133,12 +1404,11 @@ def collect(
             for alias in record["aliases"]:
                 records_by_name[alias.casefold()] = record
             apply_schema(record, resolution, dobequest)
-            refresh_relationship_schema(records)
             if record["id"] != key:
                 records[record["id"]] = records.pop(key)
             if replacement_key and replacement_key in records:
                 records.pop(replacement_key)
-            save_records(records, output)
+            persist([record["id"]], [replacement_key] if replacement_key else [])
             log_step(f"Saved record as {record['id']}", 1)
         elif (
             "breed_variety" not in record
@@ -1151,8 +1421,7 @@ def collect(
         ):
             print(f"Updating MyAKC details: {requested_name}", flush=True)
             record.update(dog_details(page, requested_name, record["akc_number"]))
-            refresh_relationship_schema(records)
-            save_records(records, output)
+            persist([record["id"]], [replacement_key] if replacement_key else [])
         if remove_after_processing and not from_local_pdf:
             log_step("Removing processed Dog of Interest from MyAKC", 1)
             remove_dog_of_interest(page, record["name"], record["akc_number"])
@@ -1167,6 +1436,10 @@ def collect(
                 log_step(f"Queueing {len(parents)} parent record(s) for generation {level + 1}", 1)
             for parent in parents:
                 pending.append((parent, level + 1))
+    if journal.journal_path.exists() and journal.journal_path.stat().st_size:
+        refresh_relationship_schema(records)
+        journal.compact(lambda: save_records(records, output))
+        log_step("Compacted final dataset journal into dogs.json")
     context.close()
     print(f"Saved {len(records)} dogs to {output}")
 
@@ -1239,40 +1512,70 @@ def main() -> int:
         action="store_true",
         help="Reuse uniquely name-matched local PDFs before MyAKC lookup",
     )
+    parser.add_argument("--journal", type=Path, help="Append-only dataset journal path (default: output with .jsonl suffix).")
+    parser.add_argument("--checkpoint-every", type=int, default=100, help="Compact journal into --output after this many record updates.")
+    parser.add_argument("--http-optimization", action="store_true", help="Use direct authenticated HTTP where response validation is available, with browser fallback.")
+    parser.add_argument("--record-har", type=Path, help="Record all browser-context page and popup traffic to this HAR file.")
     parser.add_argument("--headed", action="store_true", help="Show the browser while it runs")
     args = parser.parse_args()
     if args.levels is not None and args.levels < 1:
         parser.error("--levels must be at least 1")
-    if args.login_timeout < 1:
-        parser.error("--login-timeout must be at least 1")
+    if args.login_timeout < 1 or args.checkpoint_every < 1:
+        parser.error("--login-timeout and --checkpoint-every must be at least 1")
     username = os.environ.get("AKC_USERNAME")
     password = os.environ.get("AKC_PASSWORD")
     if not username or not password:
         parser.error("set AKC_USERNAME and AKC_PASSWORD environment variables")
+    interrupted = False
+    stop_requested = {"value": False}
+    previous_sigint = signal.getsignal(signal.SIGINT)
+
+    def request_stop(signum: int, frame: Any) -> None:
+        if stop_requested["value"]:
+            raise KeyboardInterrupt
+        stop_requested["value"] = True
+        print("Interrupt received; stopping after the current browser operation.", flush=True)
+
+    signal.signal(signal.SIGINT, request_stop)
     with sync_playwright() as playwright:
         browser = playwright.chromium.launch(headless=not args.headed)
-        collect(
-            browser,
-            username,
-            password,
-            args.name,
-            args.breed,
-            args.output,
-            args.downloads_dir,
-            args.levels,
-            args.login_timeout,
-            args.auth_state,
-            args.remove_after_processing,
-            args.dobequest_data,
-            args.dobequest_overrides,
-            args.akc_number_overrides,
-            args.pedigree_overrides,
-            args.retry_not_found,
-            args.retry_unresolved,
-            args.prefer_local_pdfs,
-        )
-        browser.close()
-    return 0
+        try:
+            collect(
+                browser,
+                username,
+                password,
+                args.name,
+                args.breed,
+                args.output,
+                args.downloads_dir,
+                args.levels,
+                args.login_timeout,
+                args.auth_state,
+                args.remove_after_processing,
+                args.dobequest_data,
+                args.dobequest_overrides,
+                args.akc_number_overrides,
+                args.pedigree_overrides,
+                args.retry_not_found,
+                args.retry_unresolved,
+                args.prefer_local_pdfs,
+                args.journal,
+                args.checkpoint_every,
+                args.http_optimization,
+                args.record_har,
+            )
+        except PlaywrightError as error:
+            if not stop_requested["value"] and "ERR_ABORTED" not in str(error):
+                raise
+            interrupted = True
+            print("Browser navigation aborted during requested shutdown.", flush=True)
+        except KeyboardInterrupt:
+            interrupted = True
+            print("Forced interrupt received; journal entries are durable and will be replayed on the next run.", flush=True)
+        finally:
+            browser.close()
+    signal.signal(signal.SIGINT, previous_sigint)
+    return 130 if interrupted or stop_requested["value"] else 0
 
 
 if __name__ == "__main__":

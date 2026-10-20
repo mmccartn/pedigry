@@ -2,6 +2,7 @@ export type DogNode = {
   name: string | null
   titles: string[]
   registration_number: string | null
+  dobequest_id: string | null
   birth_date: string | null
   registration_type: string | null
   sex: string | null

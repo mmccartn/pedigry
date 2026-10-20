@@ -1,6 +1,6 @@
 import MiniSearch from 'minisearch'
 import { useEffect, useMemo, useState } from 'react'
-import PedigreeGraph from './components/PedigreeGraph'
+import PedigreeGrid from './components/PedigreeGrid'
 import { displayName, type Dataset } from './types'
 
 type SearchDocument = {
@@ -11,22 +11,13 @@ type SearchDocument = {
   source: string
 }
 
-function ParentCard({ id, label, nodes, onSelect }: { id: string | null; label: string; nodes: Dataset['nodes']; onSelect: (id: string) => void }) {
-  const node = id ? nodes[id] : undefined
-  return (
-    <button className="parent-card" disabled={!node} onClick={() => node && onSelect(id!)}>
-      <span>{label}</span>
-      <strong>{node ? displayName(node) : 'Unknown'}</strong>
-      {node?.registration_number && <small>{node.registration_number}</small>}
-    </button>
-  )
-}
-
 export default function App() {
   const [dataset, setDataset] = useState<Dataset | null>(null)
   const [query, setQuery] = useState('')
   const [selectedId, setSelectedId] = useState<string | null>(null)
-  const [depth, setDepth] = useState(4)
+  const [tableFocusId, setTableFocusId] = useState<string | null>(null)
+  const [tableTrail, setTableTrail] = useState<string[]>([])
+  const [tableDepth, setTableDepth] = useState(6)
 
   useEffect(() => {
     fetch('/data/pedigree_dataset.json')
@@ -37,7 +28,12 @@ export default function App() {
       .then((data: Dataset) => {
         setDataset(data)
         const root = Object.entries(data.nodes).find(([, node]) => node.name === "Riviera's Some Like It Hot")
-        setSelectedId(root?.[0] ?? Object.keys(data.nodes)[0] ?? null)
+        const hashId = decodeURIComponent(window.location.hash.replace(/^#dog\//, ''))
+        const initialId = data.nodes[hashId] ? hashId : root?.[0] ?? Object.keys(data.nodes)[0] ?? null
+        setSelectedId(initialId)
+        setTableFocusId(initialId)
+        setTableTrail(initialId ? [initialId] : [])
+        if (initialId && !hashId) window.history.replaceState({ dogId: initialId }, '', `#dog/${encodeURIComponent(initialId)}`)
       })
       .catch((error: unknown) => console.error(error))
   }, [])
@@ -60,75 +56,71 @@ export default function App() {
   }, [dataset])
 
   const results = useMemo(() => {
-    if (!search || !query.trim()) return []
-    return search.search(query, { combineWith: 'AND' }).slice(0, 10)
+    const term = query.trim()
+    if (!search || term.length < 3) return []
+    return search.search(term, { combineWith: 'AND', prefix: true, fuzzy: 0.2 }).slice(0, 25)
   }, [query, search])
+
+  const highlightedIds = useMemo(() => new Set(results.map((result) => result.id)), [results])
+
+  const selectDog = (id: string, pushHistory = true) => {
+    if (!dataset?.nodes[id]) return
+    setSelectedId(id)
+    setTableFocusId(id)
+    setTableTrail([id])
+    if (pushHistory) window.history.pushState({ dogId: id }, '', `#dog/${encodeURIComponent(id)}`)
+  }
+
+  const pageTableToDog = (id: string, lineage: string[]) => {
+    if (!dataset?.nodes[id]) return
+    setTableFocusId(id)
+    setTableTrail(lineage)
+    window.history.pushState({ dogId: selectedId, tableFocusId: id, tableTrail: lineage }, '', `#dog/${encodeURIComponent(selectedId ?? id)}`)
+  }
+
+  useEffect(() => {
+    const restoreDog = () => {
+      const state = window.history.state
+      const id = state?.dogId ?? decodeURIComponent(window.location.hash.replace(/^#dog\//, ''))
+      if (!dataset?.nodes[id]) return
+      setSelectedId(id)
+      const pageId = state?.tableFocusId
+      setTableFocusId(dataset.nodes[pageId] ? pageId : id)
+      setTableTrail(Array.isArray(state?.tableTrail) ? state.tableTrail : [id])
+    }
+    window.addEventListener('popstate', restoreDog)
+    return () => window.removeEventListener('popstate', restoreDog)
+  }, [dataset])
 
   if (!dataset || !selectedId) return <main className="loading">Loading pedigry dataset…</main>
 
   const selected = dataset.nodes[selectedId]
-  const connected = [selected.sire, selected.dam].filter(Boolean).length
 
   return (
     <main>
-      <header>
-        <div>
-          <p className="eyebrow">Pedigree Explorer</p>
-          <h1>pedigry</h1>
+      <header className="workspace-bar">
+        <div className="brand">
+          <span>pedigry</span>
+          <strong>Root: {displayName(selected)}</strong>
+          <small>{selected.registration_number || selected.primary_source}</small>
         </div>
-        <div className="stats">
-          <span>{dataset.stats.total_nodes.toLocaleString()} dogs</span>
-          <span>{dataset.stats.dobequest_only_nodes.toLocaleString()} DobeQuest-only</span>
-        </div>
+        <section className="search-panel">
+          <label htmlFor="dog-search">Find a dog</label>
+          <input id="dog-search" value={query} onChange={(event) => setQuery(event.target.value)} onKeyDown={(event) => { if (event.key === 'Enter' && results[0]) { selectDog(results[0].id); setQuery('') } }} placeholder="Type 3+ characters to highlight matches" />
+          {results.length > 0 && (
+            <div className="results">
+              {results.map((result) => (
+                <button key={result.id} onClick={() => { selectDog(result.id); setQuery('') }}>
+                  <strong>{[result.titles, result.name].filter(Boolean).join(' ')}</strong>
+                  <span>{result.registrationNumber || result.source}</span>
+                </button>
+              ))}
+            </div>
+          )}
+        </section>
       </header>
 
-      <section className="search-panel">
-        <label htmlFor="dog-search">Find a dog</label>
-        <input id="dog-search" value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Name, title, or registration number" />
-        {results.length > 0 && (
-          <div className="results">
-            {results.map((result) => (
-              <button key={result.id} onClick={() => { setSelectedId(result.id); setQuery('') }}>
-                <strong>{[result.titles, result.name].filter(Boolean).join(' ')}</strong>
-                <span>{result.registrationNumber || result.source}</span>
-              </button>
-            ))}
-          </div>
-        )}
-      </section>
-
-      <section className="profile-grid">
-        <aside className="pedigree-column">
-          <ParentCard label="Sire" id={selected.sire} nodes={dataset.nodes} onSelect={setSelectedId} />
-          <div className="line" />
-          <ParentCard label="Dam" id={selected.dam} nodes={dataset.nodes} onSelect={setSelectedId} />
-        </aside>
-
-        <article className="dog-card">
-          <p className="eyebrow">Focused dog</p>
-          <h2>{displayName(selected)}</h2>
-          <dl>
-            <div><dt>Registration</dt><dd>{selected.registration_number || 'Unavailable'}</dd></div>
-            <div><dt>Born</dt><dd>{selected.birth_date || 'Unavailable'}</dd></div>
-            <div><dt>Sex</dt><dd>{selected.sex || 'Unavailable'}</dd></div>
-            <div><dt>Source</dt><dd>{selected.primary_source === 'akc' ? 'AKC' : 'DobeQuest'}</dd></div>
-            <div><dt>Known parents</dt><dd>{connected} / 2</dd></div>
-          </dl>
-        </article>
-      </section>
-
-      <section className="depth-controls">
-        <div>
-          <p className="eyebrow">Ancestry depth</p>
-          <h2>Explore ancestors</h2>
-        </div>
-        <label className="depth-slider">
-          <span>{depth === 60 ? 'All known generations' : `${depth} generations`}</span>
-          <input type="range" min="2" max="60" value={depth} onChange={(event) => setDepth(Number(event.target.value))} />
-        </label>
-      </section>
-
-      <PedigreeGraph focusId={selectedId} nodes={dataset.nodes} depth={depth} onSelect={setSelectedId} />
+      <PedigreeGrid focusId={tableFocusId ?? selectedId} rootId={selectedId} nodes={dataset.nodes} highlightedIds={highlightedIds} depth={tableDepth} rootTrail={tableTrail} onDepthChange={setTableDepth} onPage={pageTableToDog} onSelect={selectDog} />
     </main>
   )
 }

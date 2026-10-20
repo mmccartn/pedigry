@@ -15,3 +15,14 @@ step-artifacts/
 site/node_modules/
 site/dist/
 site/SITE_PLANNING.txt
+site/backup
+
+stud-scrape/data/
+bulk-scrape/dogs.txt
+bulk-scrape/ignore*
+akc-scrape/home-scrapes
+akc-scrape/downloads-test
+akc-scrape/scrapes
+site/*.zip
+stud-scrape/PLAN.txt
+

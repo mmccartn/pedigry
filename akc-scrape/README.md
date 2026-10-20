@@ -62,3 +62,19 @@ options:
 ```
 
 The scraper uses the PDF form fields for `akc_number`, `name`, `breed`, `sex`, `birth_date`, `place_of_birth`, `breeder`, `sire`, and `dam`, plus `breed_variety`, `color`, `markings`, `ofa_number`, and `medical_screens` from MyAKC's Dog Information panel. `medical_screens` is a mapping of every populated field in the Medical Screens section, such as `OFA Number` or `DNA Number`. Records also store `registration_type`, `aliases`, `sire_akc_number`, `dam_akc_number`, each parent's lookup status, `collected_at`, and the PDF filename stem as `pdf_id`. Before generating a new PDF, the scraper reuses an existing PDF with the selected AKC number when its `pdf_id` is not already assigned to another JSON record. New PDFs use the compact Herding Test/Trial form with contact fields excluded. When an AKC name lookup reports no results, the scraper retries title-stripped variants from both ends of the name, which handles titles such as `CH`, `GCH`, or `RA`. Credentials must be supplied through environment variables and are never read from or stored in project files. Fresh output uses a version-two dataset wrapper with source-aware `id`, `names`, `parents`, and `sources` fields. DobeQuest is used only for exact-name AKC-number fallback and profile provenance; AKC remains the source for birthplace and core form data.
+
+## HTTP optimization and HAR capture
+
+Use `--record-har` to capture the entire Playwright browser context, including Add Dog and entry-form popups:
+
+```bash
+python akc_pedigree_scraper.py "Example Dog" \
+  --record-har step-artifacts/net-recordings/main-test.har \
+  --headed
+```
+
+Use `--http-optimization` to try direct authenticated HTTP for simple single-result Doberman name lookups and Add Dog requests. Multi-result, title-normalized, Roman-suffix, and unexpected response shapes automatically use the established browser workflow.
+
+## Journal checkpoints
+
+Record updates append to a JSONL journal beside the output dataset and compact into the full `dogs.json` snapshot every 100 updates by default. Use `--checkpoint-every` to change that interval and `--journal` to choose a journal path. Press `Ctrl+C` once to request a graceful stop; Git Bash browser aborts are recognized as shutdown rather than printed as tracebacks, and durable journal entries replay automatically on the next run.
