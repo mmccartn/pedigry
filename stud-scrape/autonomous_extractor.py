@@ -422,6 +422,8 @@ def get_surya_predictor():
             os.environ["LLAMA_CPP_BINARY"] = str(llama_bin)
             os.environ["PATH"] = str(llama_dirs[0]) + os.pathsep + os.environ.get("PATH", "")
 
+        os.environ.setdefault("SURYA_INFERENCE_BACKEND", "llamacpp")
+
         from surya.settings import settings
         # Check if local GGUF models exist in bin/ or cache
         local_gguf = bin_dir / "surya-2.5.gguf"
@@ -448,7 +450,15 @@ def run_column_ocr(col_png: Path, col_txt: Path, engine: str = "tesseract") -> s
             try:
                 img = Image.open(col_png)
                 results = predictor([img], full_page=True)
-                lines = [line.text for line in results[0].text_lines]
+                lines = []
+                for res in results:
+                    if hasattr(res, "blocks"):
+                        for block in res.blocks:
+                            if getattr(block, "html", None):
+                                clean_text = re.sub(r"<[^>]+>", "\n", block.html)
+                                lines.extend([ln.strip() for ln in clean_text.splitlines() if ln.strip()])
+                    elif hasattr(res, "text_lines"):
+                        lines.extend([getattr(line, "text", str(line)) for line in res.text_lines])
                 text = "\n".join(lines)
                 col_txt.write_text(text, encoding="utf-8")
                 return text
