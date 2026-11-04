@@ -20,7 +20,7 @@ export default function App() {
   const [tableDepth, setTableDepth] = useState(6)
 
   useEffect(() => {
-    fetch('/pedigry/data/pedigree_dataset.json')
+    fetch(`${import.meta.env.BASE_URL}data/pedigree_dataset.json`)
       .then((response) => {
         if (!response.ok) throw new Error(`Dataset request failed: ${response.status}`)
         return response.json()

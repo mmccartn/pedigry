@@ -343,6 +343,7 @@ export default function PedigreeGrid({
               const textY = minTextCenter > maxTextCenter
                 ? center
                 : Math.max(minTextCenter, Math.min(center, maxTextCenter))
+              const birthYear = cell.dog.birth_date?.match(/(\d{4})$/)?.[1]
               const secondary = cell.dog.registration_number
                 ?? (cell.dog.dobequest_id ? `DobeQuest ${cell.dog.dobequest_id}` : '')
 
@@ -360,7 +361,7 @@ export default function PedigreeGrid({
                 >
                   <span className="pedigree-cell-content" style={{ top: textY - cell.top }}>
                     <strong>{cell.dog.name ?? 'Unknown dog'}</strong>
-                    <small>{secondary}</small>
+                    <small>{[secondary, birthYear].filter(Boolean).join(' · ')}</small>
                   </span>
                 </button>
               )

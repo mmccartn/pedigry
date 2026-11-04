@@ -52,6 +52,24 @@ from akc_pedigree_scraper import (
 )
 
 NUMBER_PATTERN = re.compile(r"^[A-Z]{1,3}\d{5,8}$")
+NETWORK_ERROR_PATTERN = re.compile(
+    r"ECONNRESET|ECONNREFUSED|ECONNABORTED|ENETUNREACH|EHOSTUNREACH|ETIMEDOUT|EAI_AGAIN|ENOTFOUND|ERR_INTERNET_DISCONNECTED|ERR_NETWORK_CHANGED|ERR_CONNECTION_|ERR_NAME_NOT_RESOLVED|socket hang up",
+    re.I,
+)
+
+
+def is_network_error(error: Exception) -> bool:
+    """Return whether a Playwright failure is a transient network transport error."""
+    return bool(NETWORK_ERROR_PATTERN.search(str(error)))
+
+
+def response_text(response: Any) -> str:
+    """Decode legacy MyAKC response bytes without assuming UTF-8."""
+    data = response.body()
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError:
+        return data.decode("cp1252", errors="replace")
 
 
 def load_json(path: Path, fallback: Any) -> Any:
@@ -163,7 +181,7 @@ def direct_number_lookup_add(page: Any, akc_number: str) -> tuple[str, str]:
     )
     if not response.ok:
         raise AkcLookupError("number_mismatch", f"Direct AKC lookup returned HTTP {response.status} for {akc_number!r}.")
-    body = response.text()
+    body = response_text(response)
     if re.search(r"not found in our database|could not be found", body, re.I):
         raise AkcLookupError("number_mismatch", f"AKC could not resolve number {akc_number!r}.")
     number_match = re.search(r"name=['\"]dog_reg_num['\"][^>]*value=['\"]([^'\"]+)", body, re.I)
@@ -192,7 +210,7 @@ def direct_table_rows(page: Any, numbers: list[str]) -> dict[str, dict[str, str]
         table_response = page.context.request.get(table_url)
         if not table_response.ok:
             raise AkcFormError(f"Direct MyAKC table request returned HTTP {table_response.status}")
-        table_html = table_response.text()
+        table_html = table_response_text(response)
         rows: dict[str, dict[str, str]] = {}
         for akc_number in numbers:
             row_pattern = re.compile(
@@ -252,7 +270,7 @@ def direct_dog_details(page: Any, akc_number: str, row: dict[str, str] | None = 
     )
     if not detail_response.ok:
         raise AkcFormError(f"Direct Dog Information request returned HTTP {detail_response.status} for {akc_number!r}")
-    detail_html = detail_response.text()
+    detail_html = detail_response_text(detail_response)
     if akc_number not in detail_html:
         raise AkcFormError(f"Direct Dog Information response does not contain {akc_number!r}")
     text = re.sub(r"(?i)<br\s*/?>|</(?:td|tr|p|li|div|h[1-6])>", "\n", detail_html)
@@ -292,7 +310,7 @@ def direct_batch_chooser(page: Any, rows: dict[str, dict[str, str]], numbers: li
     chooser = page.context.request.get(chooser_url)
     if not chooser.ok:
         raise AkcFormError(f"Direct batch chooser request returned HTTP {chooser.status}")
-    chooser_html = chooser.text()
+    chooser_html = response_text(chooser)
     customer = re.search(r"name=['\"]key_customer['\"][^>]*value=['\"]([^'\"]+)", chooser_html, re.I)
     if not customer:
         raise AkcFormError("Direct batch chooser response is missing key_customer")
@@ -334,7 +352,7 @@ def download_batch_entry_form_http_data(page: Any, chooser_data: dict[str, Any],
     report = page.context.request.get(report_url)
     if not report.ok:
         raise AkcFormError(f"Direct MyAKC PDF report request returned HTTP {report.status} for {akc_number!r}")
-    match = re.search(r'''href=["']([^"']*/akcecom/pdf/cms/[^"']+)["']''', report.text(), re.I)
+    match = re.search(r'''href=["']([^"']*/akcecom/pdf/cms/[^"']+)["']''', response_text(report), re.I)
     if not match:
         raise AkcFormError(f"Direct MyAKC PDF report has no PDF link for {akc_number!r}")
     pdf_url = urljoin(report.url, match.group(1).replace("&amp;", "&"))
@@ -411,7 +429,7 @@ def download_batch_entry_form_http(page: Any, chooser: Any, akc_number: str, dow
     report = page.context.request.get(report_url)
     if not report.ok:
         raise AkcFormError(f"Direct MyAKC PDF report request returned HTTP {report.status} for {akc_number!r}")
-    report_text = report.text()
+    report_text = response_text(report)
     match = re.search(r'''href=["']([^"']*/akcecom/pdf/cms/[^"']+)["']''', report_text, re.I)
     if not match:
         raise AkcFormError(f"Direct MyAKC PDF report has no PDF link for {akc_number!r}")
@@ -693,11 +711,15 @@ def main() -> int:
                     journal.compact(lambda: save_records(records, args.output))
                     saved_since_checkpoint = 0
                     log_step("Compacted dataset journal into dogs.json", 0)
-        except PlaywrightError as error:
-            if not stop_requested["value"] and "ERR_ABORTED" not in str(error):
+        except (PlaywrightError, UnicodeDecodeError) as error:
+            if stop_requested["value"] or "ERR_ABORTED" in str(error):
+                interrupted = True
+                print("Browser navigation aborted during requested shutdown.", flush=True)
+            elif is_network_error(error):
+                interrupted = True
+                print(f"Network transport failure; stopping cleanly for a later retry: {error}", flush=True)
+            else:
                 raise
-            interrupted = True
-            print("Browser navigation aborted during requested shutdown.", flush=True)
         except KeyboardInterrupt:
             interrupted = True
             print("Forced interrupt received; preserving journal without compaction.", flush=True)

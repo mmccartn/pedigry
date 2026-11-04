@@ -1,4 +1,6 @@
 __pycache__/
+*.patch
+*.zip
 .akc-auth-state.json
 akc-scrape/unresolved-*.txt
 combine/pedigree_dataset.json
@@ -12,17 +14,25 @@ NOTES.md
 result-reports/
 step-artifacts/
 
+akc-scrape/scrapes/
+akc-scrape/dogs.jsonl
+akc-scrape/dogs.bulk-manifest.json
+akc-scrape/work-dogs.json
+
 site/node_modules/
 site/dist/
 site/SITE_PLANNING.txt
-site/backup
+site/*.zip
+site/public/data/pedigree_dataset_all.json
 
 stud-scrape/data/
 bulk-scrape/dogs.txt
 bulk-scrape/ignore*
 akc-scrape/home-scrapes
 akc-scrape/downloads-test
-akc-scrape/scrapes
-site/*.zip
 stud-scrape/PLAN.txt
-
+stud-scrape/parser/
+stud-scrape/dependencies/
+stud-scrape/extract_1930_01_doberman.py
+stud-scrape/extract_all_dobermans.py
+stud-scrape/bin

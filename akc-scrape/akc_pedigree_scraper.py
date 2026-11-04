@@ -724,8 +724,57 @@ def direct_name_lookup_add(page: Page, name: str, breed: str) -> tuple[str, str]
     return canonical_name, akc_number
 
 
-def choose_dog_by_number(page: Page, akc_number: str) -> tuple[str, str]:
+def direct_number_lookup_add(page: Page, akc_number: str) -> tuple[str, str]:
+    """Resolve and add a dog by AKC registration number through direct HTTP requests."""
+    page.goto(MANAGE_DOGS_URL, wait_until="domcontentloaded")
+    row = managed_row(page, "", akc_number)
+    if row.count():
+        return row.locator("a.gridlink").first.inner_text().strip(), akc_number
+
+    lookup_url = "https://www.apps.akc.org/apps/online_accounts/dog_management/index_popup_dog.cfm?action=add_dog"
+    response = page.context.request.post(
+        lookup_url,
+        form={"dog_reg_num": akc_number, "litter_num": "", "get_dog_by": "D", "dog_name": "", "bvgcode": ""},
+    )
+    if not response.ok:
+        raise AkcLookupError("http_fallback", f"Direct number lookup returned HTTP {response.status}.")
+
+    body = response.text()
+    if "too many dogs were found" in body.lower() or "could not be found" in body.lower() or "no results were found" in body.lower():
+        raise AkcLookupError("number_mismatch", f"AKC could not resolve number {akc_number!r}.")
+
+    number_match = re.search(r"name=['\"]dog_reg_num['\"][^>]*value=['\"]([^'\"]+)", body, re.I)
+    name_match = re.search(r"<strong[^>]*>\s*(.*?)\s*</strong>", body, re.I | re.S)
+    if not number_match or not name_match:
+        raise AkcLookupError("http_fallback", "Direct number lookup returned unexpected HTML.")
+
+    res_number = unescape(number_match.group(1)).strip()
+    if res_number != akc_number:
+        raise AkcLookupError("number_mismatch", f"AKC returned {res_number!r} for {akc_number!r}.")
+
+    canonical_name = re.sub(r"<[^>]+>", "", unescape(name_match.group(1))).strip()
+
+    add_response = page.context.request.post(
+        "https://www.apps.akc.org/apps/online_accounts/dog_management/index_popup_dog.cfm?action=add_dog_io",
+        form={"dog_dio_int": "DOI", "dog_active": "NONE", "dog_reg_num": akc_number, "Submit": "Next >"},
+    )
+    if not add_response.ok:
+        raise AkcLookupError("http_fallback", f"Direct Add Dog request returned HTTP {add_response.status}.")
+
+    page.goto(MANAGE_DOGS_URL, wait_until="domcontentloaded")
+    return canonical_name, akc_number
+
+
+def choose_dog_by_number(page: Page, akc_number: str, http_optimization: bool = False) -> tuple[str, str]:
     """Add or reuse a dog by a verified AKC registration number."""
+    if http_optimization:
+        try:
+            return direct_number_lookup_add(page, akc_number)
+        except AkcLookupError as http_error:
+            if http_error.status != "http_fallback":
+                raise
+            log_step(f"Direct number lookup requires browser fallback: {http_error}", 2)
+
     page.goto(MANAGE_DOGS_URL, wait_until="domcontentloaded")
     row = managed_row(page, "", akc_number)
     if row.count():
@@ -1247,7 +1296,7 @@ def collect(
             try:
                 if akc_override:
                     log_step(f"Using verified AKC override: {akc_override['akc_number']}", 1)
-                    canonical_name, selected_akc_number = choose_dog_by_number(page, akc_override["akc_number"])
+                    canonical_name, selected_akc_number = choose_dog_by_number(page, akc_override["akc_number"], http_optimization)
                     resolution = "resolved_by_manual_akc_override"
                 else:
                     log_step("Searching AKC by name", 1)
@@ -1271,7 +1320,7 @@ def collect(
                     )
                     try:
                         canonical_name, selected_akc_number = choose_dog_by_number(
-                            page, dobequest["akc_number"]
+                            page, dobequest["akc_number"], http_optimization
                         )
                         resolution = "resolved_by_dobequest_akc_number"
                     except AkcLookupError as number_error:
@@ -1361,7 +1410,7 @@ def collect(
                 if dobequest and dobequest["akc_number"] and dobequest["akc_number"] != selected_akc_number:
                     log_step(f"Retrying verified DobeQuest AKC number: {dobequest['akc_number']}", 2)
                     try:
-                        canonical_name, selected_akc_number = choose_dog_by_number(page, dobequest["akc_number"])
+                        canonical_name, selected_akc_number = choose_dog_by_number(page, dobequest["akc_number"], http_optimization)
                         details = dog_details(page, canonical_name, selected_akc_number)
                         pdf = reusable_pdf(downloads_dir, selected_akc_number, mapped_pdf_ids(records), pdf_number_index)
                         if not pdf:
