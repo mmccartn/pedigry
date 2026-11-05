@@ -542,10 +542,15 @@ def process_volume(
     jp2_dir: Path,
     manifest: dict[str, Any],
     work_dir: Path,
-    ocr_engine: str = "tesseract"
+    ocr_engine: str = "tesseract",
+    target_leaves: list[int] | None = None
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Extract Doberman records for an issue using auto-segmented column re-OCR."""
-    leaves = locate_doberman_leaves(vol_dir)
+    if target_leaves is not None:
+        leaves = target_leaves
+    else:
+        leaves = locate_doberman_leaves(vol_dir)
+
     if not leaves:
         return [], []
 
@@ -723,6 +728,9 @@ def main() -> int:
     parser.add_argument("--flags-output", type=Path, default=Path(__file__).resolve().parent / "data" / "review_flags.json")
     parser.add_argument("--year-from", type=int, default=1926)
     parser.add_argument("--year-to", type=int, default=1926)
+    parser.add_argument("--issue", type=int, help="Specific monthly issue number (e.g. 1)")
+    parser.add_argument("--leaf-start", type=int, help="Starting leaf index (optional, overrides auto-detection)")
+    parser.add_argument("--leaf-end", type=int, help="Ending leaf index (optional, overrides auto-detection)")
     parser.add_argument("--workers", type=int, default=max(1, min(8, (os.cpu_count() or 4))), help="Concurrent worker processes")
     parser.add_argument("--ocr-engine", type=str, default="tesseract", choices=["tesseract", "surya"], help="OCR engine to use ('tesseract' or 'surya')")
     args = parser.parse_args()
@@ -730,23 +738,31 @@ def main() -> int:
     manifest = json.loads(args.manifest.read_text(encoding="utf-8")) if args.manifest.exists() else {}
     vol_dirs = sorted([d for d in args.volumes_dir.iterdir() if d.is_dir() and any(d.glob("*_djvu.xml"))])
 
+    target_leaves = None
+    if args.leaf_start is not None and args.leaf_end is not None:
+        target_leaves = list(range(args.leaf_start, args.leaf_end + 1))
+
     filtered = []
     for d in vol_dirs:
         m = re.search(r"(\d{4})", d.name)
         yr = int(m.group(1)) if m else None
         if yr and args.year_from <= yr <= args.year_to:
+            if args.issue is not None:
+                m_iss = re.search(r"_(\d{1,2})$", d.name)
+                if not m_iss or int(m_iss.group(1)) != args.issue:
+                    continue
             filtered.append(d)
 
-    print(f"Autonomous Extractor running on {len(filtered)} volumes ({args.year_from}-{args.year_to}) using {args.workers} parallel workers...")
+    print(f"Autonomous Extractor running on {len(filtered)} volume(s) ({args.year_from}-{args.year_to}) using {args.workers} workers [Engine: {args.ocr_engine}]...")
 
     all_records: list[dict[str, Any]] = []
     all_flags: list[dict[str, Any]] = []
     work_dir = Path(__file__).resolve().parent / "data" / "auto_work"
 
-    tasks = [(v_path.name, v_path, args.jp2_dir, manifest, work_dir, args.ocr_engine) for v_path in filtered]
+    tasks = [(v_path.name, v_path, args.jp2_dir, manifest, work_dir, args.ocr_engine, target_leaves) for v_path in filtered]
 
     with ProcessPoolExecutor(max_workers=args.workers) as executor:
-        futures = {executor.submit(process_volume, b_id, v_p, jp2_d, mf, w_d, eng): b_id for b_id, v_p, jp2_d, mf, w_d, eng in tasks}
+        futures = {executor.submit(process_volume, b_id, v_p, jp2_d, mf, w_d, eng, t_l): b_id for b_id, v_p, jp2_d, mf, w_d, eng, t_l in tasks}
         completed = 0
         for fut in as_completed(futures):
             completed += 1

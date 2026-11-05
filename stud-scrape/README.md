@@ -141,6 +141,51 @@ python report_counts.py --year 1929
 python report_counts.py --all
 ```
 
+## Gemini Vision Stud Book Extractor (Multi-Breed & All Fields)
+
+The script `gemini_studbook_extractor.py` provides vision-based transcription directly from scan images:
+- **All Dog Breeds:** Transcribes all breeds on the page into unified JSON.
+- **Deep Extended Ancestry:** Parses multi-generational lineage trees into structured ancestor objects.
+- **Handwritten Notes:** Transcribes librarian pencil/pen notes and marginalia into a separate `handwritten_annotations` list.
+- **Supplementary Sections:** Extracts Changes of Ownership / Transfers, Corrections, and Cancellations.
+- **Adaptive Image Compression:** Auto-downscales large page scans to max 2200px width with quality JPEG compression to eliminate network timeouts.
+
+### Setup & Usage
+
+1. Create a `.env` file in the project root:
+   ```env
+   GEMINI_API_KEY=your_key_here
+   ```
+2. Run extraction:
+   ```bash
+   # Process a range of pages in a volume with per-page caching
+   python gemini_studbook_extractor.py --year 1929 --issue 1 --leaf-start 40 --leaf-end 41
+
+   # Send complete full pages without column slicing
+   python gemini_studbook_extractor.py --year 1929 --issue 1 --full-page --leaf-start 40 --leaf-end 41
+
+   # Extract from an individual image file
+   python gemini_studbook_extractor.py --image path/to/scan.png
+   ```
+
+## Standalone On-Demand JP2 Page Downloader
+
+The tool `download_jp2_pages.py` downloads specific individual pages or full page ranges from Internet Archive `_jp2.zip` archives over HTTP Range requests without downloading entire volume zips:
+
+```bash
+# Download a single leaf
+python download_jp2_pages.py --year 1929 --issue 1 --leaf 40
+
+# Download a range of leaves
+python download_jp2_pages.py --year 1929 --issue 1 --range 3 65
+
+# Download all primary registration pages in the volume
+python download_jp2_pages.py --year 1929 --issue 1 --all-registrations
+
+# Download only leaves containing a specific breed
+python download_jp2_pages.py --year 1929 --issue 1 --breed "Doberman"
+```
+
 ## Keyboard-First Review GUI
 
 The review tool (`review_gui.py`) is a lightweight local web application designed to review and correct flagged entries with high speed.
