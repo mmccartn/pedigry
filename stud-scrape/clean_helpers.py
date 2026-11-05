@@ -13,7 +13,8 @@ def clean_ocr(text: str) -> str:
     t = re.sub(r"_+", "", t)
 
     # Fix OCR noise on sex bracket e.g. '(BP:' -> '(B)', '(BD' -> '(B)', '(RB)' -> '(B)', 'P (698' -> '(D) (698'
-    t = re.sub(r"\((?:BP:?|BD|RB|\(?B\)?[:_]?)\b", "(B)", t)
+    t = re.sub(r"\((?:BP:?|BD|RB|B[:_]?)\)", "(B)", t)
+    t = re.sub(r"\((?:BP:?|BD|RB)\b", "(B)", t)
     t = re.sub(r"\(B\)[:_]", "(B)", t)
     t = re.sub(r"\(([b])\)", "(B)", t)
     t = re.sub(r"\b(?:it|II|III)\s+\(([Bb])\)", r"(B)", t)
@@ -30,8 +31,8 @@ def clean_ocr(text: str) -> str:
     # Pull registration number on next line up to the dog name line with sex bracket:
     t = re.sub(r"(\([DBE8FR]{1,2}\))\s*\n\s*[a-zA-Z\d\W]{0,20}?\(([0-9]{3}[,\.\s]+[0-9]{3})\)", r"\1 (\2)\n", t)
 
-    # Fix missing sex bracket e.g. 'FRITZ V FUHRMANN  (680,142)' -> 'FRITZ V FUHRMANN (D) (680,142)'
-    t = re.sub(r"(\b[A-Za-z\s]{4,35})\s+[\-\—\s]+\(([0-9]{3}[,\.\s]+[0-9]{3})\)", r"\1 (D) (\2)", t)
+    # Fix missing sex bracket e.g. 'FRITZ V FUHRMANN (680,142)' -> 'FRITZ V FUHRMANN (D) (680,142)'
+    t = re.sub(r"(?<!\([DBE8FR]\)\s)(?<!\([DBE8FR]\))(\b[A-Z][A-Z\s\.\'\-_]{3,45}?)\s+[\-\—]?\s*\(([0-9]{3}[,\.\s]+[0-9]{3})\)", r"\1 (D) (\2)", t)
 
     # Fix spaces inside numbers e.g. '(69 ,699)' -> '(692,699)'
     t = re.sub(r"\(\s*69\s+[,.]\s*699\s*\)", "(692,699)", t)

@@ -4,6 +4,7 @@ __pycache__/
 .env
 .env.*
 *.env
+test_*.py
 .akc-auth-state.json
 akc-scrape/unresolved-*.txt
 combine/pedigree_dataset.json

@@ -11,7 +11,15 @@ from __future__ import annotations
 
 import argparse
 from concurrent.futures import ProcessPoolExecutor, as_completed
+import difflib
+
 import io
+import html
+import sqlite3
+
+
+import time
+
 import json
 import os
 import re
@@ -68,8 +76,16 @@ FOLLOWING_BREEDS = [
 ]
 
 DOG_HEADER_PAT = re.compile(
-    r"^(?:[a-zA-Z]{1,3}\s+)?[^\w\r\n]*([A-Za-z0-9\s\.\'\-_]{3,50}?)\s*[\(\[]+([DBE8FR]{1,2})[\)\]_]+\s*[\(\[]+([0-9\s,\-\*\.]+)[\]\)]+"
+    r"^(?:[a-z]{1,2}\s+)?[^\w\r\n]*([A-Za-z\u00C0-\u017F0-9\s\.\'\-_]{3,50}?)\s*[\(\[]+([DBE8FR]{1,2})[\)\]_]+\s*[\(\[]+([0-9\s,\-\*\.]+)[\]\)]+"
 )
+
+
+def find_doberman_start(text: str) -> int:
+    """Find where Doberman section starts in page/column body, matching ALL-CAPS PINSCHERS."""
+    m = re.search(r"\bPINSCHERS?\s*\([^\)]*Doberman[^\)]*\)", text)
+    if m:
+        return m.start()
+    return -1
 
 
 class RemoteZipFile(io.RawIOBase):
@@ -108,7 +124,7 @@ class RemoteZipFile(io.RawIOBase):
 
 
 def fetch_remote_leaf(identifier: str, leaf_idx: int, out_dir: Path) -> Path | None:
-    """Download only the requested leaf scan from Archive.org jp2.zip using HTTP range requests."""
+    """Download only the requested leaf scan from Archive.org jp2.zip using HTTP range requests with retries."""
     out_dir.mkdir(parents=True, exist_ok=True)
     expected_fname = f"{identifier}_{leaf_idx:04d}.jp2"
     local_path = out_dir / expected_fname
@@ -116,26 +132,29 @@ def fetch_remote_leaf(identifier: str, leaf_idx: int, out_dir: Path) -> Path | N
         return local_path
 
     zip_url = f"https://archive.org/download/{identifier}/{identifier}_jp2.zip"
-    try:
-        req = urllib.request.Request(zip_url, headers={"User-Agent": USER_AGENT, "Range": "bytes=0-0"})
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            cr = resp.headers.get("Content-Range")
-            if not cr:
-                return None
-            total_size = int(cr.split("/")[-1])
+    for attempt in range(1, 4):
+        try:
+            req = urllib.request.Request(zip_url, headers={"User-Agent": USER_AGENT, "Range": "bytes=0-0"})
+            with urllib.request.urlopen(req, timeout=20) as resp:
+                cr = resp.headers.get("Content-Range")
+                if not cr:
+                    return None
+                total_size = int(cr.split("/")[-1])
 
-        rz = RemoteZipFile(zip_url, total_size)
-        zf = zipfile.ZipFile(rz)
-        target_name = f"{identifier}_jp2/{expected_fname}"
-        matches = [info for info in zf.infolist() if expected_fname in info.filename]
-        if not matches:
-            return None
-        data = zf.read(matches[0].filename)
-        local_path.write_bytes(data)
-        return local_path
-    except Exception as err:
-        print(f"Warning: remote range fetch failed for {identifier} leaf {leaf_idx}: {err}", file=sys.stderr)
-        return None
+            rz = RemoteZipFile(zip_url, total_size)
+            zf = zipfile.ZipFile(rz)
+            matches = [info for info in zf.infolist() if expected_fname in info.filename]
+            if not matches:
+                return None
+            data = zf.read(matches[0].filename)
+            local_path.write_bytes(data)
+            return local_path
+        except Exception as err:
+            if attempt < 3:
+                time.sleep(1.5 * attempt)
+            else:
+                print(f"Warning: remote range fetch failed for {identifier} leaf {leaf_idx}: {err}", file=sys.stderr)
+                return None
 
 
 def determine_era_layout(date_str: str) -> str:
@@ -199,19 +218,20 @@ def find_column_gutters(img: Image.Image, layout_style: str = "monthly_3col") ->
     w_content = page_right - page_left
 
     # 2-column layout (1933-07 to 1949-04)
+    overlap = 50
     if layout_style == "monthly_2col":
         center_g = page_left + int(w_content * 0.40) + int(np.argmin(smoothed[page_left + int(w_content * 0.40):page_left + int(w_content * 0.60)]))
-        col1 = (max(0, page_left - 15), y_start, center_g, y_end)
-        col2 = (center_g, y_start, min(w, page_right + 15), y_end)
+        col1 = (max(0, page_left - 20), y_start, min(w, center_g + overlap), y_end)
+        col2 = (max(0, center_g - overlap), y_start, min(w, page_right + 20), y_end)
         return [col1, col2]
 
     # Standard 3-column layout (1926-01 to 1933-06)
     g1_x = page_left + int(w_content * 0.23) + int(np.argmin(smoothed[page_left + int(w_content * 0.23):page_left + int(w_content * 0.43)]))
     g2_x = page_left + int(w_content * 0.56) + int(np.argmin(smoothed[page_left + int(w_content * 0.56):page_left + int(w_content * 0.76)]))
 
-    col1 = (max(0, page_left - 15), y_start, g1_x, y_end)
-    col2 = (g1_x, y_start, g2_x, y_end)
-    col3 = (g2_x, y_start, min(w, page_right + 15), y_end)
+    col1 = (max(0, page_left - 20), y_start, min(w, g1_x + overlap), y_end)
+    col2 = (max(0, g1_x - overlap), y_start, min(w, g2_x + overlap), y_end)
+    col3 = (max(0, g2_x - overlap), y_start, min(w, page_right + 20), y_end)
     return [col1, col2, col3]
 
 
@@ -323,7 +343,11 @@ def parse_dog_entry(
         whelped = date_fallback.group(1).strip() if date_fallback else None
         color = None
         by_fallback = re.search(r"\bBy\s+(.+)$", body, re.IGNORECASE)
-        pedigree_text = by_fallback.group(1).strip() if by_fallback else ""
+        if by_fallback:
+            pedigree_text = by_fallback.group(1).strip()
+        else:
+            out_fallback = re.search(r"(?<=\.\s)([A-Z][a-zA-Z\s\.\'\-_]+(?:\([^\)]+\))?\s+out of\s+.+)$", body, re.IGNORECASE)
+            pedigree_text = out_fallback.group(1).strip() if out_fallback else ""
         if not whelped:
             flags.append("missing_birth_date")
 
@@ -347,7 +371,8 @@ def parse_dog_entry(
         "sire_registration_number": sire_reg,
         "dam": dam_name,
         "dam_registration_number": dam_reg,
-        "source": meta
+        "source": meta,
+        "raw_body": body
     }
     if ext_ancestry:
         record["extended_ancestry"] = ext_ancestry
@@ -407,6 +432,30 @@ def extract_archive_xml_candidates(vol_dir: Path, leaves: list[int]) -> dict[str
 _SURYA_INITIALIZED = False
 _SURYA_PREDICTOR = None
 
+
+def _safe_surya_stop_process(pid: int, name: str) -> None:
+    """Safe process terminator for Surya on Windows/POSIX to avoid atexit deadlocks."""
+    if not pid:
+        return
+    if sys.platform == "win32":
+        try:
+            subprocess.run(["taskkill", "/F", "/T", "/PID", str(pid)], capture_output=True)
+        except Exception:
+            pass
+    else:
+        try:
+            os.kill(pid, 15)
+            for _ in range(10):
+                try:
+                    os.kill(pid, 0)
+                except ProcessLookupError:
+                    return
+                time.sleep(0.1)
+            os.kill(pid, 9)
+        except (ProcessLookupError, OSError):
+            pass
+
+
 def get_surya_predictor():
     """Lazily load Surya RecognitionPredictor if local model files or environment are configured."""
     global _SURYA_INITIALIZED, _SURYA_PREDICTOR
@@ -416,15 +465,22 @@ def get_surya_predictor():
     _SURYA_INITIALIZED = True
     try:
         bin_dir = Path(__file__).resolve().parent / "bin"
-        llama_dirs = list(bin_dir.glob("*llama*"))
-        if llama_dirs and (llama_dirs[0] / "llama-server.exe").exists():
-            llama_bin = llama_dirs[0] / "llama-server.exe"
+        if (bin_dir / "llama-server.exe").exists():
+            llama_bin = bin_dir / "llama-server.exe"
             os.environ["LLAMA_CPP_BINARY"] = str(llama_bin)
-            os.environ["PATH"] = str(llama_dirs[0]) + os.pathsep + os.environ.get("PATH", "")
+            os.environ["PATH"] = str(bin_dir) + os.pathsep + os.environ.get("PATH", "")
+        else:
+            llama_dirs = [d for d in bin_dir.glob("*llama*") if d.is_dir()]
+            if llama_dirs and (llama_dirs[0] / "llama-server.exe").exists():
+                llama_bin = llama_dirs[0] / "llama-server.exe"
+                os.environ["LLAMA_CPP_BINARY"] = str(llama_bin)
+                os.environ["PATH"] = str(llama_dirs[0]) + os.pathsep + os.environ.get("PATH", "")
 
-        os.environ.setdefault("SURYA_INFERENCE_BACKEND", "llamacpp")
+        os.environ["SURYA_INFERENCE_BACKEND"] = "llamacpp"
 
         from surya.settings import settings
+        settings.SURYA_INFERENCE_BACKEND = "llamacpp"
+
         # Check if local GGUF models exist in bin/ or cache
         local_gguf = bin_dir / "surya-2.5.gguf"
         local_mmproj = bin_dir / "surya-2.5-mmproj.gguf"
@@ -432,6 +488,13 @@ def get_surya_predictor():
             settings.SURYA_GGUF_LOCAL_MODEL_PATH = str(local_gguf)
         if local_mmproj.exists():
             settings.SURYA_GGUF_LOCAL_MMPROJ_PATH = str(local_mmproj)
+
+        # Patch Surya's backend spawn cleaner to avoid Windows atexit time.sleep hangs
+        try:
+            import surya.inference.backends.spawn as _spawn
+            _spawn._stop_process = _safe_surya_stop_process
+        except Exception:
+            pass
 
         from surya.recognition import RecognitionPredictor
         _SURYA_PREDICTOR = RecognitionPredictor()
@@ -455,10 +518,10 @@ def run_column_ocr(col_png: Path, col_txt: Path, engine: str = "tesseract") -> s
                     if hasattr(res, "blocks"):
                         for block in res.blocks:
                             if getattr(block, "html", None):
-                                clean_text = re.sub(r"<[^>]+>", "\n", block.html)
+                                clean_text = html.unescape(re.sub(r"<[^>]+>", "\n", block.html))
                                 lines.extend([ln.strip() for ln in clean_text.splitlines() if ln.strip()])
                     elif hasattr(res, "text_lines"):
-                        lines.extend([getattr(line, "text", str(line)) for line in res.text_lines])
+                        lines.extend([html.unescape(getattr(line, "text", str(line))) for line in res.text_lines])
                 text = "\n".join(lines)
                 col_txt.write_text(text, encoding="utf-8")
                 return text
@@ -474,6 +537,106 @@ def run_column_ocr(col_png: Path, col_txt: Path, engine: str = "tesseract") -> s
     if col_txt.exists():
         return col_txt.read_text(encoding="utf-8", errors="replace")
     return ""
+
+def run_page_ocr(img_path: Path, txt_path: Path) -> str:
+    """Run full-page Surya OCR without manual column slicing."""
+    predictor = get_surya_predictor()
+    if predictor is not None:
+        try:
+            img = Image.open(img_path)
+            results = predictor([img], full_page=True)
+            lines = []
+            for res in results:
+                if hasattr(res, "blocks"):
+                    for block in res.blocks:
+                        if getattr(block, "html", None):
+                            clean_text = html.unescape(re.sub(r"<[^>]+>", "\n", block.html))
+                            lines.extend([ln.strip() for ln in clean_text.splitlines() if ln.strip()])
+                elif hasattr(res, "text_lines"):
+                    lines.extend([html.unescape(getattr(line, "text", str(line))) for line in res.text_lines])
+            text = "\n".join(lines)
+            txt_path.write_text(text, encoding="utf-8")
+            return text
+        except Exception as err:
+            print(f"Surya full-page OCR failed for {img_path.name}: {err}", file=sys.stderr)
+    return ""
+
+
+def save_to_sqlite(db_path: Path, records: list[dict[str, Any]]) -> None:
+    """Save extracted dog registrations into a clean SQLite relational database."""
+    if not records:
+        return
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS dogs (
+            registration_number TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            breed TEXT NOT NULL DEFAULT 'Doberman Pinscher',
+            sex TEXT,
+            color TEXT,
+            birth_date TEXT,
+            owner TEXT,
+            owner_location TEXT,
+            breeder TEXT,
+            breeder_location TEXT,
+            sire TEXT,
+            sire_registration_number TEXT,
+            dam TEXT,
+            dam_registration_number TEXT,
+            volume_identifier TEXT,
+            date TEXT,
+            volume TEXT,
+            issue TEXT,
+            leaf_number INTEGER,
+            column_number INTEGER,
+            recovery_source TEXT
+        );
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_dogs_sire ON dogs(sire_registration_number);")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_dogs_dam ON dogs(dam_registration_number);")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_dogs_vol ON dogs(volume_identifier);")
+
+        insert_sql = """
+        INSERT OR REPLACE INTO dogs (
+            registration_number, name, breed, sex, color, birth_date,
+            owner, owner_location, breeder, breeder_location,
+            sire, sire_registration_number, dam, dam_registration_number,
+            volume_identifier, date, volume, issue, leaf_number, column_number, recovery_source
+        ) VALUES (
+            :reg, :name, :breed, :sex, :color, :bdate,
+            :owner, :oloc, :breeder, :bloc,
+            :sire, :sreg, :dam, :dreg,
+            :vol_id, :vdate, :vol, :iss, :leaf, :col, :source
+        );
+        """
+        rows = []
+        for r in records:
+            src = r.get("source", {})
+            rows.append({
+                "reg": r.get("registration_number", ""),
+                "name": r.get("name", ""),
+                "breed": r.get("breed", "Doberman Pinscher"),
+                "sex": r.get("sex"),
+                "color": r.get("color"),
+                "bdate": r.get("birth_date"),
+                "owner": r.get("owner"),
+                "oloc": r.get("owner_location"),
+                "breeder": r.get("breeder"),
+                "bloc": r.get("breeder_location"),
+                "sire": r.get("sire"),
+                "sreg": r.get("sire_registration_number"),
+                "dam": r.get("dam"),
+                "dreg": r.get("dam_registration_number"),
+                "vol_id": src.get("identifier"),
+                "vdate": src.get("date"),
+                "vol": src.get("volume"),
+                "iss": src.get("issue"),
+                "leaf": src.get("leaf"),
+                "col": src.get("column"),
+                "source": src.get("recovery_source")
+            })
+        conn.executemany(insert_sql, rows)
 
 
 def locate_doberman_leaves(vol_dir: Path) -> list[int]:
@@ -587,24 +750,20 @@ def process_volume(
 
         img = Image.open(jp2_path)
         gutters = find_column_gutters(img, layout_style)
-
-        # If section has ended on a previous column/leaf, do not continue in following leaves
-        if not in_doberman_section and leaf_idx > leaves[0]:
-            # Only enter if the heading appears in this leaf
-            pass
-
+        segments = []
         for col_idx, box in enumerate(gutters, 1):
             crop = img.crop(box)
             col_png = work_dir / f"{identifier}_leaf_{leaf_idx}_col{col_idx}.png"
             crop.save(col_png)
             col_txt = work_dir / f"{identifier}_leaf_{leaf_idx}_col{col_idx}_ocr.txt"
-            raw_ocr = run_column_ocr(col_png, col_txt, engine=ocr_engine)
+            col_raw = run_column_ocr(col_png, col_txt, engine=ocr_engine)
+            segments.append((col_idx, col_raw))
 
+        for col_idx, raw_ocr in segments:
             # Check if section starts in this column
-            if "PINSCHERS (Doberman)" in raw_ocr or "Pinschers (Doberman)" in raw_ocr:
-                head_pos = raw_ocr.find("PINSCHERS (Doberman)")
-                if head_pos == -1: head_pos = raw_ocr.find("Pinschers (Doberman)")
-                raw_ocr = raw_ocr[head_pos:]
+            start_pos = find_doberman_start(raw_ocr)
+            if start_pos != -1:
+                raw_ocr = raw_ocr[start_pos:]
                 in_doberman_section = True
             elif not in_doberman_section:
                 continue
@@ -627,6 +786,26 @@ def process_volume(
                 m = DOG_HEADER_PAT.match(line)
                 if m:
                     matches.append((line_m.start(), line_m.start() + m.end(), m))
+
+            # Cross-column entry stitching for dogs that wrap across column boundaries
+            if matches and matches[0][0] > 0 and vol_records:
+                leading_text = cleaned_ocr[:matches[0][0]].strip()
+                last_rec = vol_records[-1]
+                if (not last_rec.get("birth_date") or not last_rec.get("sire")) and len(leading_text) > 10:
+                    stitched_body = (last_rec.get("raw_body", "") + " " + leading_text).strip()
+                    updated_rec, updated_flags = parse_dog_entry(
+                        last_rec["name"], last_rec["sex"], last_rec["registration_number"],
+                        stitched_body, last_rec["source"]
+                    )
+                    vol_records[-1] = updated_rec
+                    vol_flags = [f for f in vol_flags if f.get("registration_number") != last_rec["registration_number"]]
+                    if updated_flags:
+                        vol_flags.append({
+                            "name": last_rec["name"],
+                            "registration_number": last_rec["registration_number"],
+                            "flags": updated_flags,
+                            "source": last_rec["source"]
+                        })
 
             for idx, (m_start, m_end, m) in enumerate(matches):
                 name = re.sub(r"\s+", " ", m.group(1).replace("\n", " ")).strip()
@@ -658,7 +837,7 @@ def process_volume(
                         "source": col_meta
                     })
 
-            # Check if a following breed was encountered in this column:
+            # Check if a following breed was encountered in this column/page:
             # If so, the Doberman section has ended completely; do not process subsequent columns/leaves!
             for fb in FOLLOWING_BREEDS:
                 if re.search(rf"\b{re.escape(fb)}\b", raw_ocr[20:], re.IGNORECASE):
@@ -677,13 +856,17 @@ def process_volume(
         cand_name = re.sub(r"\bPAL\s+V\s+DD?\s+TAXILUST\b", "PAL V D TAXILUST", cand_name, flags=re.IGNORECASE).strip()
         cand_norm = re.sub(r"[^A-Za-z0-9]", "", cand_name.casefold())
 
-        # If the registration is already present OR the exact dog name was already extracted, do not duplicate!
-        if cand_reg in extracted_regs or (cand_norm and cand_norm in extracted_names):
+        # If the registration is already present OR the dog name was already extracted (with OCR typo tolerance or substring match), do not duplicate!
+        if cand_reg in extracted_regs or (cand_norm and any(
+            difflib.SequenceMatcher(None, cand_norm, en).ratio() >= 0.80 or (len(cand_norm) >= 5 and cand_norm in en) or (len(en) >= 5 and en in cand_norm)
+            for en in extracted_names
+        )):
             continue
 
         if len(cand_reg) >= 5:
             # Quality filter: skip candidates that are clearly following breeds or lack valid dog name
-            if any(fb in cand_name.upper() for fb in ("POINTERS", "POMERANIANS", "RUMSON")):
+            cand_upper = cand_name.upper().replace(" ", "")
+            if any(fb.replace(" ", "") in cand_upper for fb in ("POINTERS", "POMERANIANS", "RUMSON")):
                 continue
             col_meta = dict(vol_meta)
             col_meta["leaf"] = cand.get("leaf", leaves[0])
@@ -726,6 +909,7 @@ def main() -> int:
     parser.add_argument("--manifest", type=Path, default=Path(__file__).resolve().parent / "data" / "manifest.json")
     parser.add_argument("--output", type=Path, default=Path(__file__).resolve().parent / "data" / "autonomous_dobermans.json")
     parser.add_argument("--flags-output", type=Path, default=Path(__file__).resolve().parent / "data" / "review_flags.json")
+    parser.add_argument("--db", type=Path, default=Path(__file__).resolve().parent / "data" / "dobermans.db", help="SQLite database path to store extracted dogs")
     parser.add_argument("--year-from", type=int, default=1926)
     parser.add_argument("--year-to", type=int, default=1926)
     parser.add_argument("--issue", type=int, help="Specific monthly issue number (e.g. 1)")
@@ -753,43 +937,69 @@ def main() -> int:
                     continue
             filtered.append(d)
 
-    print(f"Autonomous Extractor running on {len(filtered)} volume(s) ({args.year_from}-{args.year_to}) using {args.workers} workers [Engine: {args.ocr_engine}]...")
+    active_workers = 1 if args.ocr_engine.lower() == "surya" else min(args.workers, max(1, len(filtered)))
+    print(f"Autonomous Extractor running on {len(filtered)} volume(s) ({args.year_from}-{args.year_to}) using {active_workers} workers [Engine: {args.ocr_engine}]...")
 
     all_records: list[dict[str, Any]] = []
     all_flags: list[dict[str, Any]] = []
     work_dir = Path(__file__).resolve().parent / "data" / "auto_work"
 
+    def save_outputs():
+        if not all_records and not args.output.exists():
+            pass
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        args.output.write_text(json.dumps({
+            "year_from": args.year_from,
+            "year_to": args.year_to,
+            "total_records": len(all_records),
+            "total_flagged": len(all_flags),
+            "records": all_records
+        }, indent=2), encoding="utf-8")
+
+        args.flags_output.parent.mkdir(parents=True, exist_ok=True)
+        args.flags_output.write_text(json.dumps({
+            "total_records": len(all_records),
+            "total_flagged": len(all_flags),
+            "flags_ratio": f"{len(all_flags) / max(1, len(all_records)) * 100:.1f}%",
+            "flagged_entries": all_flags
+        }, indent=2), encoding="utf-8")
+
+        if args.db and all_records:
+            save_to_sqlite(args.db, all_records)
+
     tasks = [(v_path.name, v_path, args.jp2_dir, manifest, work_dir, args.ocr_engine, target_leaves) for v_path in filtered]
 
-    with ProcessPoolExecutor(max_workers=args.workers) as executor:
-        futures = {executor.submit(process_volume, b_id, v_p, jp2_d, mf, w_d, eng, t_l): b_id for b_id, v_p, jp2_d, mf, w_d, eng, t_l in tasks}
+    try:
         completed = 0
-        for fut in as_completed(futures):
-            completed += 1
-            b_id = futures[fut]
-            try:
-                records, flags = fut.result()
-                print(f"[{completed}/{len(filtered)}] {b_id}: {len(records)} dogs ({len(flags)} flagged)", flush=True)
-                all_records.extend(records)
-                all_flags.extend(flags)
-            except Exception as err:
-                print(f"[{completed}/{len(filtered)}] Error processing {b_id}: {err}", file=sys.stderr, flush=True)
-
-    args.output.parent.mkdir(parents=True, exist_ok=True)
-    args.output.write_text(json.dumps({
-        "year_from": args.year_from,
-        "year_to": args.year_to,
-        "total_records": len(all_records),
-        "total_flagged": len(all_flags),
-        "records": all_records
-    }, indent=2), encoding="utf-8")
-
-    args.flags_output.write_text(json.dumps({
-        "total_records": len(all_records),
-        "total_flagged": len(all_flags),
-        "flags_ratio": f"{len(all_flags) / max(1, len(all_records)) * 100:.1f}%",
-        "flagged_entries": all_flags
-    }, indent=2), encoding="utf-8")
+        if args.ocr_engine.lower() == "surya":
+            effective_workers = 1
+        else:
+            effective_workers = min(args.workers, len(tasks))
+        if effective_workers <= 1:
+            for b_id, v_p, jp2_d, mf, w_d, eng, t_l in tasks:
+                completed += 1
+                try:
+                    records, flags = process_volume(b_id, v_p, jp2_d, mf, w_d, eng, t_l)
+                    print(f"[{completed}/{len(filtered)}] {b_id}: {len(records)} dogs ({len(flags)} flagged)", flush=True)
+                    all_records.extend(records)
+                    all_flags.extend(flags)
+                except Exception as err:
+                    print(f"[{completed}/{len(filtered)}] Error processing {b_id}: {err}", file=sys.stderr, flush=True)
+        else:
+            with ProcessPoolExecutor(max_workers=effective_workers) as executor:
+                futures = {executor.submit(process_volume, b_id, v_p, jp2_d, mf, w_d, eng, t_l): b_id for b_id, v_p, jp2_d, mf, w_d, eng, t_l in tasks}
+                for fut in as_completed(futures):
+                    completed += 1
+                    b_id = futures[fut]
+                    try:
+                        records, flags = fut.result()
+                        print(f"[{completed}/{len(filtered)}] {b_id}: {len(records)} dogs ({len(flags)} flagged)", flush=True)
+                        all_records.extend(records)
+                        all_flags.extend(flags)
+                    except Exception as err:
+                        print(f"[{completed}/{len(filtered)}] Error processing {b_id}: {err}", file=sys.stderr, flush=True)
+    finally:
+        save_outputs()
 
     print(f"\nExtraction complete! {len(all_records)} total records saved to {args.output}")
     print(f"{len(all_flags)} review flags saved to {args.flags_output}")
