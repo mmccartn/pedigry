@@ -40,4 +40,6 @@ stud-scrape/dependencies/
 stud-scrape/extract_1930_01_doberman.py
 stud-scrape/extract_all_dobermans.py
 stud-scrape/bin
-stud-scrape/build_1929_01.py
+stud-scrape/build_*.py
+stud-scrape/transcribe_*
+stud-scrape/*.csv

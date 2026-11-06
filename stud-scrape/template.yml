@@ -350,3 +350,43 @@
   count: 19
   first: LASKA V NIBELUNGENHORT
   last: ZEPPELIN V SCHWARZSCHILD
+
+# ==========================================================
+# Volume: 1933-07 (sim_american-kennel-club-stud-book-register_1933-07-01_50_7)
+# Expected Total: 62
+# ==========================================================
+
+- leaf: 82
+  page: 82
+  column: right
+  count: 3
+  first: ADONIS V D STOECKERSBURG
+  last: ALEX V D KLESSMANNSHOHE
+
+- leaf: 82
+  page: 83
+  column: left
+  count: 19
+  first: ALEX OF REACREST
+  last: FRITZ V_HIEBER-SCHULTZ
+
+- leaf: 82
+  page: 83
+  column: right
+  count: 16
+  first: FRITZIE RAAB
+  last: JATZ V WILSONA HOF
+
+- leaf: 84
+  page: 84
+  column: left
+  count: 19
+  first: JERRY V NIBELUNGENHORT
+  last: SUE OF POCAHONTAS
+
+- leaf: 84
+  page: 84
+  column: right
+  count: 5
+  first: TINA V REICHSBURG
+  last: WANDA V KISSINGER
