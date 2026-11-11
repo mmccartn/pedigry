@@ -17,6 +17,7 @@ failed-scrapes/
 NOTES.md
 result-reports/
 step-artifacts/
+bin/
 
 akc-scrape/scrapes/
 akc-scrape/dogs.jsonl
@@ -43,3 +44,5 @@ stud-scrape/bin
 stud-scrape/build_*.py
 stud-scrape/transcribe_*
 stud-scrape/*.csv
+
+catalog-scrape/data
